@@ -2,3 +2,7 @@
 name = "bondnet-server"
 version = "0.1.0"
 edition = "2024"
+
+[dependencies]
+bondnet-protocol = { version = "0.1.0", path = "../bondnet-protocol" }
+tokio = { version = "1.53.1", features = ["net", "rt", "rt-multi-thread", "macros", "signal", "time", "sync"] }

@@ -1,8 +1,27 @@
-
-**`configs/client.example.toml`**
-```toml
 # Example BondNet client configuration.
 # Copy to client.toml (gitignored) and fill in real values. Never commit real secrets.
+
+[transport]
+# Local IPv4 address owned by the physical interface this path should use.
+# Find yours with: Get-NetIPConfiguration (Windows) / ip addr (Linux).
+# Port 0 = allocate an ephemeral port automatically.
+local_addr = "192.168.0.170:0"
+
+# VPS endpoint running bondnet-server (default port 51820).
+# 203.0.113.10 is a documentation IP; replace it with your real VPS address.
+remote_addr = "203.0.113.10:51820"
+
+# BondNet logical path identifier. Opaque number — never derived from the
+# port, interface index, or IP address. Use a different path_id per
+# physical path (second path arrives Day 12).
+path_id = 1
+
+# BondNet tunnel session identifier. Explicit for now; no session
+# negotiation exists yet.
+session_id = 1001
+
+# First outbound tunnel sequence number.
+initial_sequence = 1
 
 [vps]
 # Public address of your BondNet VPS. 203.0.113.10 is a documentation IP; replace it.

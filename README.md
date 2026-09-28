@@ -5,5 +5,5 @@
 ## Current status
 
 ```text
-Day 1 — Workspace foundation
+Day 7 — First physical-path UDP transport (bondnet-client)
 ```
