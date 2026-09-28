@@ -1,0 +1,14 @@
+
+**`configs/client.example.toml`**
+```toml
+# Example BondNet client configuration.
+# Copy to client.toml (gitignored) and fill in real values. Never commit real secrets.
+
+[vps]
+# Public address of your BondNet VPS. 203.0.113.10 is a documentation IP; replace it.
+address = "203.0.113.10"
+port = 51820
+
+[identity]
+# Pre-shared key for the tunnel. Generate one with: openssl rand -hex 32
+# psk = "REPLACE_ME"

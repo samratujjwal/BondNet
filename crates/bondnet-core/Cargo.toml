@@ -1,0 +1,12 @@
+[package]
+name = "bondnet-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Declared now to lock the intended dependency direction (client/server ->
+# core -> protocol/crypto/scheduler). The real usage arrives with the tunnel
+# implementation; the wiring itself documents the architecture on Day 1.
+bondnet-protocol = { path = "../bondnet-protocol" }
+bondnet-crypto = { path = "../bondnet-crypto" }
+bondnet-scheduler = { path = "../bondnet-scheduler" }

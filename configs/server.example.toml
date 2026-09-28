@@ -1,0 +1,14 @@
+# Example BondNet server configuration.
+# Copy to server.toml (gitignored) and fill in real values. Never commit real secrets.
+
+[listen]
+address = "0.0.0.0"
+port = 51820
+
+[tunnel]
+# Tunnel subnet. The server takes .1; clients are assigned addresses from this range.
+subnet = "10.200.0.0/24"
+
+[identity]
+# Pre-shared key. Must match the client's key.
+# psk = "REPLACE_ME"
