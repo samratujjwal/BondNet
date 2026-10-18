@@ -61,6 +61,7 @@ name = "bondnet-server"
 version = "0.1.0"
 dependencies = [
  "bondnet-protocol",
+ "libc",
  "tokio",
 ]
 

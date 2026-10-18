@@ -29,6 +29,91 @@ pub struct UdpPathConfig {
     pub initial_sequence: u64,
 }
 
+/// Day 13: configuration for one physical path, without session identity.
+///
+/// The session ID is supplied separately when the path is built into a
+/// `UdpPath` (via [`PhysicalPathConfig::to_udp_path_config`]), keeping
+/// path configuration independent of session identity. Two paths in the
+/// same manager share the session but must have different path IDs.
+#[derive(Debug, Clone)]
+pub struct PhysicalPathConfig {
+    /// Descriptive name for logs and diagnostics, e.g. "primary-wifi".
+    pub name: String,
+    /// BondNet logical path identifier. Must be unique within a manager,
+    /// even if the local addresses differ.
+    pub path_id: u16,
+    /// Local address to bind. Must be an IPv4 address owned by the
+    /// intended physical interface, e.g. `192.168.0.170:0`. Port 0 means
+    /// "allocate an ephemeral port".
+    pub local_addr: SocketAddr,
+    /// VPS endpoint, e.g. `203.0.113.10:51820`. Port 0 is rejected for
+    /// an enabled path (there is nothing to talk to).
+    pub remote_addr: SocketAddr,
+    /// Disabled paths are validated but never bound.
+    pub enabled: bool,
+}
+
+impl PhysicalPathConfig {
+    /// Attach the session identity to produce the `UdpPathConfig` that
+    /// `UdpPath::bind` expects. The caller chooses the initial sequence
+    /// (1 for production, explicit values for deterministic tests).
+    pub fn to_udp_path_config(&self, session_id: u64, initial_sequence: u64) -> UdpPathConfig {
+        UdpPathConfig {
+            path_id: self.path_id,
+            session_id,
+            local_addr: self.local_addr,
+            remote_addr: self.remote_addr,
+            initial_sequence,
+        }
+    }
+}
+
+/// Validate a set of physical path configurations.
+///
+/// Rejects:
+/// - duplicate path IDs, even when the local addresses differ;
+/// - an enabled path whose remote port is 0 (nothing to talk to);
+/// - non-IPv4 local or remote addresses (consistent with Day 7);
+/// - an empty path name.
+///
+/// Disabled paths are still validated (a typo should fail fast, not
+/// silently at enable time). Does not bind any socket.
+pub fn validate_path_configs(paths: &[PhysicalPathConfig]) -> Result<(), String> {
+    use std::collections::HashSet;
+    let mut seen_ids = HashSet::new();
+    for (index, path) in paths.iter().enumerate() {
+        if path.name.trim().is_empty() {
+            return Err(format!("path at index {index} has an empty name"));
+        }
+        if !seen_ids.insert(path.path_id) {
+            return Err(format!(
+                "duplicate path_id {} (path \"{}\"): path IDs must be unique \
+                 even when local addresses differ",
+                path.path_id, path.name,
+            ));
+        }
+        if !path.local_addr.ip().is_ipv4() {
+            return Err(format!(
+                "path \"{}\" binds a non-IPv4 local address: {}",
+                path.name, path.local_addr,
+            ));
+        }
+        if !path.remote_addr.ip().is_ipv4() {
+            return Err(format!(
+                "path \"{}\" has a non-IPv4 remote address: {}",
+                path.name, path.remote_addr,
+            ));
+        }
+        if path.enabled && path.remote_addr.port() == 0 {
+            return Err(format!(
+                "path \"{}\" is enabled but its remote port is 0",
+                path.name,
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Parse a minimal dev CLI:
 ///
 /// `bondnet-client --local 192.168.0.170:0 --remote VPS:51820
@@ -178,5 +263,78 @@ mod tests {
         let mut a = full();
         a.push("--nope".to_string());
         assert!(parse_args(&a).is_err());
+    }
+
+    // Day 13: PhysicalPathConfig validation.
+
+    fn path(name: &str, id: u16, local: &str, remote: &str, enabled: bool) -> PhysicalPathConfig {
+        PhysicalPathConfig {
+            name: name.to_string(),
+            path_id: id,
+            local_addr: local.parse().unwrap(),
+            remote_addr: remote.parse().unwrap(),
+            enabled,
+        }
+    }
+
+    fn two_valid_paths() -> Vec<PhysicalPathConfig> {
+        vec![
+            path("primary", 1, "127.0.0.1:0", "127.0.0.1:51820", true),
+            path("secondary", 2, "127.0.0.1:0", "127.0.0.1:51820", true),
+        ]
+    }
+
+    #[test]
+    fn two_distinct_paths_validate() {
+        assert!(validate_path_configs(&two_valid_paths()).is_ok());
+    }
+
+    #[test]
+    fn duplicate_path_ids_rejected_even_with_different_locals() {
+        let mut paths = two_valid_paths();
+        paths[1].path_id = 1;
+        paths[1].local_addr = "127.0.0.2:0".parse().unwrap();
+        let err = validate_path_configs(&paths).unwrap_err();
+        assert!(err.contains("duplicate path_id 1"), "got: {err}");
+    }
+
+    #[test]
+    fn enabled_path_with_zero_remote_port_rejected() {
+        let mut paths = two_valid_paths();
+        paths[0].remote_addr = "127.0.0.1:0".parse().unwrap();
+        let err = validate_path_configs(&paths).unwrap_err();
+        assert!(err.contains("remote port is 0"), "got: {err}");
+    }
+
+    #[test]
+    fn disabled_path_with_zero_remote_port_ok() {
+        let mut paths = two_valid_paths();
+        paths[1].enabled = false;
+        paths[1].remote_addr = "127.0.0.1:0".parse().unwrap();
+        assert!(validate_path_configs(&paths).is_ok());
+    }
+
+    #[test]
+    fn empty_name_rejected() {
+        let mut paths = two_valid_paths();
+        paths[0].name = "   ".to_string();
+        assert!(validate_path_configs(&paths).is_err());
+    }
+
+    #[test]
+    fn physical_path_non_ipv4_local_rejected() {
+        let mut paths = two_valid_paths();
+        paths[0].local_addr = "[::1]:0".parse().unwrap();
+        assert!(validate_path_configs(&paths).is_err());
+    }
+
+    #[test]
+    fn to_udp_path_config_attaches_session() {
+        let p = path("primary", 1, "127.0.0.1:0", "127.0.0.1:51820", true);
+        let udp = p.to_udp_path_config(1001, 42);
+        assert_eq!(udp.path_id, 1);
+        assert_eq!(udp.session_id, 1001);
+        assert_eq!(udp.initial_sequence, 42);
+        assert_eq!(udp.local_addr.to_string(), "127.0.0.1:0");
     }
 }

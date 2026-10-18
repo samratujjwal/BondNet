@@ -6,3 +6,13 @@ edition = "2024"
 [dependencies]
 bondnet-protocol = { version = "0.1.0", path = "../bondnet-protocol" }
 tokio = { version = "1.53.1", features = ["net", "rt", "rt-multi-thread", "macros", "signal", "time", "sync"] }
+
+# Raw TUN ioctls are Linux-only. Every other platform builds the server
+# without a TUN backend (TunDevice::create returns UnsupportedPlatform).
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+# Day 12 e2e simulation: the fake-device harness exercises the real client
+# encode/validate logic against the real server pipeline in-process.
+bondnet-client = { version = "0.1.0", path = "../bondnet-client" }

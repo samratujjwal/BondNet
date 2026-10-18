@@ -2,7 +2,7 @@
 
 use std::sync::Arc;
 
-use bondnet_server::{Server, parse_args};
+use bondnet_server::{Server, parse_args, print_setup_guide};
 
 #[tokio::main]
 async fn main() {
@@ -11,10 +11,26 @@ async fn main() {
         Ok(config) => config,
         Err(error) => {
             eprintln!("error: {error}");
-            eprintln!("usage: bondnet-server [--bind ADDR:PORT] [--verbose]");
+            eprintln!(
+                "usage: bondnet-server [--bind ADDR:PORT] [--verbose] [--tun-name NAME --tun-addr IP --tun-prefix N] [--wan-iface NAME] [--print-setup]"
+            );
             std::process::exit(2);
         }
     };
+
+    // Day 10: print the explicit administrator setup commands (TUN
+    // address, forwarding, NAT) and exit without binding anything.
+    if config.print_setup {
+        let tun = config
+            .tun_config()
+            .expect("parse_args already validated TUN flags");
+        let mut out = String::new();
+        // fmt::Write on String cannot fail; the expect documents that.
+        print_setup_guide(tun.as_ref(), config.wan_interface.as_deref(), &mut out)
+            .expect("writing the setup guide to a String cannot fail");
+        print!("{out}");
+        return;
+    }
 
     // Day 6 honesty: this speaks the BondNet protocol WITHOUT encryption.
     // Crypto integration is a later milestone. Development use only.

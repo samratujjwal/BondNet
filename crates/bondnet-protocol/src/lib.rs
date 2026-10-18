@@ -11,8 +11,10 @@
 pub mod codec;
 pub mod constants;
 pub mod error;
+pub mod ip;
 pub mod packet;
 
 pub use constants::{HEADER_LEN, MAGIC, MAX_PAYLOAD_LEN, PROTOCOL_VERSION};
 pub use error::ProtocolError;
+pub use ip::{IpRejectReason, IpVersion, validate_ip_packet};
 pub use packet::{Packet, PacketHeader, PacketType};

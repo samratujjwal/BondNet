@@ -24,17 +24,18 @@
 //! packets, never the tunnel's egress. No routes, DNS, MTU or NAT are
 //! touched.
 
+#[cfg(windows)]
+use bondnet_client::data_plane::DATA_PLANE_CHANNEL_CAPACITY;
 use bondnet_client::data_plane::DataPlane;
+#[cfg(windows)]
+use bondnet_client::return_path::RETURN_CHANNEL_CAPACITY;
+use bondnet_client::return_path::ReturnProcessor;
 use bondnet_client::synthetic;
 use bondnet_client::{UdpPath, UdpPathConfig};
 
-// The Wintun data path (Mode B) only exists on Windows; these imports
-// are gated so the portable synthetic mode stays warning-free on Linux.
-#[cfg(windows)]
-use bondnet_client::data_plane::DATA_PLANE_CHANNEL_CAPACITY;
-#[cfg(windows)]
+// The Wintun data path (Mode B) only exists on Windows; the return-path
+// plumbing (Mode A + shared receiver) uses these on every platform.
 use std::sync::Arc;
-#[cfg(windows)]
 use std::sync::atomic::{AtomicBool, Ordering};
 #[cfg(windows)]
 use std::time::Duration;
@@ -52,6 +53,8 @@ struct TunnelArgs {
     synthetic: bool,
     synthetic_count: u64,
     verbose: bool,
+    /// Day 11: enable the return path (UDP → validate → Wintun).
+    ret: bool,
 }
 
 /// Parse the words after `tunnel-smoke`. Separate from the Day 7 parser
@@ -65,6 +68,7 @@ fn parse_tunnel_args(args: &[String]) -> Result<TunnelArgs, String> {
     let mut synthetic = false;
     let mut synthetic_count: u64 = 5;
     let mut verbose = false;
+    let mut ret = false;
 
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -121,6 +125,7 @@ fn parse_tunnel_args(args: &[String]) -> Result<TunnelArgs, String> {
                 }
             }
             "--verbose" => verbose = true,
+            "--return" => ret = true,
             other => return Err(format!("unknown tunnel-smoke argument: {other}")),
         }
     }
@@ -143,6 +148,7 @@ fn parse_tunnel_args(args: &[String]) -> Result<TunnelArgs, String> {
         synthetic,
         synthetic_count,
         verbose,
+        ret,
     })
 }
 
@@ -151,12 +157,13 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     let parsed = parse_tunnel_args(args).map_err(|e| {
         format!(
             "{e}\nusage: bondnet-client tunnel-smoke --local ADDR:PORT --remote ADDR:PORT \
-             --path-id N --session-id N [--adapter NAME] [--synthetic] [--synthetic-count N] [--verbose]"
+             --path-id N --session-id N [--adapter NAME] [--synthetic] [--synthetic-count N] \
+             [--return] [--verbose]"
         )
     })?;
 
     println!(
-        "WARNING: BondNet Day 9 is plaintext (no encryption yet). Development use only — send harmless test payloads, never secrets."
+        "WARNING: BondNet Day 11 is plaintext (no encryption yet). Development use only — send harmless test payloads, never secrets."
     );
 
     if parsed.synthetic {
@@ -168,8 +175,12 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
 /// Mode A: deterministic synthetic packets through the data plane. No
 /// Wintun, portable, proves protocol + transport + server.
+///
+/// With `--return`, after sending it also listens for return packets
+/// (validating and counting them; there is no Wintun to write to in this
+/// mode) until Ctrl+C.
 async fn run_synthetic(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>> {
-    let path = UdpPath::bind(parsed.config).await?;
+    let path = Arc::new(UdpPath::bind(parsed.config).await?);
     println!(
         "tunnel-smoke (synthetic): local={} remote={} session={} path={}",
         path.local_addr()?,
@@ -177,7 +188,7 @@ async fn run_synthetic(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Err
         path.session_id(),
         path.path_id(),
     );
-    let plane = DataPlane::new(path);
+    let plane = DataPlane::new(Arc::clone(&path));
 
     for i in 0..parsed.synthetic_count {
         let inner_len = SYNTHETIC_SIZES[(i as usize) % SYNTHETIC_SIZES.len()];
@@ -196,7 +207,106 @@ async fn run_synthetic(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Err
         "done: tunnel_packets_sent={} tunnel_bytes_sent={} send_errors={} oversized_dropped={}",
         m.tunnel_packets_sent, m.tunnel_bytes_sent, m.send_errors, m.oversized_dropped
     );
+
+    if parsed.ret {
+        let shutdown = Arc::new(AtomicBool::new(false));
+        {
+            let flag = Arc::clone(&shutdown);
+            tokio::spawn(async move {
+                let _ = tokio::signal::ctrl_c().await;
+                flag.store(true, Ordering::SeqCst);
+            });
+        }
+        let metrics = Arc::new(bondnet_client::return_path::ReturnMetrics::default());
+        let processor = ReturnProcessor::with_metrics(
+            plane_session(&plane),
+            plane_path(&plane),
+            Arc::clone(&metrics),
+        );
+        println!("Listening for return packets... (Ctrl+C to stop)");
+        return_receiver_loop(path, processor, None, Arc::clone(&shutdown), parsed.verbose).await;
+        let m = metrics.snapshot();
+        println!(
+            "return done: packets_received={} bytes_received={} invalid_protocol={} \
+             invalid_session_path={} invalid_ip={} backpressure_dropped={}",
+            m.packets_received,
+            m.bytes_received,
+            m.invalid_protocol,
+            m.invalid_session_path,
+            m.invalid_ip,
+            m.backpressure_dropped,
+        );
+    }
     Ok(())
+}
+
+/// Day 11: async UDP receive loop shared by both smoke modes.
+///
+/// Receives datagrams, validates them through `processor`, and — in Wintun
+/// mode — forwards validated payload bytes into `inbound_tx` for the
+/// Wintun writer thread. In synthetic mode `inbound_tx` is `None` and
+/// packets are only validated and counted. Runs until `shutdown` is set;
+/// the 1-second receive timeout only re-checks the flag, it is not a
+/// packet-latency bound.
+async fn return_receiver_loop(
+    path: Arc<UdpPath>,
+    processor: ReturnProcessor,
+    inbound_tx: Option<tokio::sync::mpsc::Sender<Vec<u8>>>,
+    shutdown: Arc<AtomicBool>,
+    verbose: bool,
+) {
+    let metrics = Arc::clone(processor.metrics());
+    let mut received = 0u64;
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            break;
+        }
+        match tokio::time::timeout(std::time::Duration::from_secs(1), path.recv_packet()).await {
+            Ok(Ok(packet)) => match processor.validate(&packet) {
+                Ok(payload) => {
+                    received += 1;
+                    if verbose && received % 50 == 1 {
+                        println!("return received inner={}B", payload.len());
+                    }
+                    if let Some(tx) = &inbound_tx {
+                        match tx.try_send(payload.to_vec()) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                metrics.backpressure_dropped.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                        }
+                    }
+                }
+                Err(error) => {
+                    if verbose {
+                        eprintln!("return packet rejected: {error}");
+                    }
+                }
+            },
+            Ok(Err(error)) => {
+                // Decode failures are per-datagram, not fatal. Count them
+                // as protocol errors; the transport stays usable.
+                metrics.invalid_protocol.fetch_add(1, Ordering::Relaxed);
+                if verbose {
+                    eprintln!("return recv failed: {error}");
+                }
+            }
+            Err(_) => {
+                // Timeout: re-check the shutdown flag.
+            }
+        }
+    }
+}
+
+/// Session ID of the path behind a data plane (for the return processor).
+fn plane_session(plane: &DataPlane) -> u64 {
+    plane.path_session_id()
+}
+
+/// Path ID of the path behind a data plane (for the return processor).
+fn plane_path(plane: &DataPlane) -> u16 {
+    plane.path_path_id()
 }
 
 /// Deterministic per-packet payload: distinct bytes per packet index so a
@@ -208,6 +318,10 @@ fn deterministic_payload(len: usize, index: u64) -> Vec<u8> {
 }
 
 /// Mode B: real Wintun packets through the data plane (Windows only).
+///
+/// With `--return` (Day 11) the reverse path is also live: an async task
+/// receives UDP datagrams, validates them, and hands the payload bytes to
+/// the Wintun thread, which writes them into the adapter's send ring.
 #[cfg(windows)]
 async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>> {
     use bondnet_client::wintun::{
@@ -223,7 +337,10 @@ async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>
     // The tunnel socket binds the PHYSICAL address — never Wintun. This
     // binding is the routing-recursion guard: tunnel UDP leaves through
     // the real interface, inner packets come from Wintun.
-    let path = UdpPath::bind(parsed.config).await?;
+    //
+    // Day 11: the path is shared with the return receiver task, which
+    // reads from the same socket the sender writes to.
+    let path = Arc::new(UdpPath::bind(parsed.config).await?);
     let actual_local = path.local_addr()?;
     println!(
         "Tunnel UDP: {actual_local} -> {} (physical interface)",
@@ -237,7 +354,7 @@ async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>
         );
     }
 
-    let plane = DataPlane::new(path);
+    let plane = DataPlane::new(Arc::clone(&path));
     let metrics = Arc::clone(plane.metrics());
 
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -251,8 +368,9 @@ async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>
 
     let (tx, mut rx) = mpsc::channel::<Vec<u8>>(DATA_PLANE_CHANNEL_CAPACITY);
 
-    // Async sender task: the ONLY code that touches the UDP socket.
-    // Send failures are counted and logged; the loop keeps draining.
+    // Async sender task: the ONLY code that touches the UDP socket for
+    // sending. Send failures are counted and logged; the loop keeps
+    // draining.
     let verbose = parsed.verbose;
     let sender = tokio::spawn(async move {
         let mut sent = 0u64;
@@ -269,11 +387,45 @@ async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>
         }
     });
 
+    // Day 11 return path: validate inbound datagrams on an async task,
+    // hand the payload bytes to the Wintun thread for the actual write
+    // (WintunSession is !Sync — all adapter access stays on one thread).
+    // Metrics are shared via Arc so the final report sees the task's counts.
+    let return_metrics = parsed.ret.then(|| {
+        println!("Return path enabled: UDP -> validate -> Wintun");
+        Arc::new(bondnet_client::return_path::ReturnMetrics::default())
+    });
+    let (inbound_tx, inbound_rx) = return_metrics
+        .as_ref()
+        .map(|_| mpsc::channel::<Vec<u8>>(RETURN_CHANNEL_CAPACITY))
+        .unzip();
+    let return_task = match (&return_metrics, inbound_tx) {
+        (Some(metrics), Some(tx)) => {
+            let task_processor = ReturnProcessor::with_metrics(
+                path.session_id(),
+                path.path_id(),
+                Arc::clone(metrics),
+            );
+            let task_path = Arc::clone(&path);
+            let task_shutdown = Arc::clone(&shutdown);
+            Some(tokio::spawn(async move {
+                return_receiver_loop(task_path, task_processor, Some(tx), task_shutdown, verbose)
+                    .await;
+            }))
+        }
+        _ => None,
+    };
+
     // Blocking Wintun reader on a dedicated OS thread (brief Option A).
     // `thread::scope` lets the session borrow `adapter` without 'static;
     // `block_in_place` keeps the blocking wait off Tokio worker threads.
+    //
+    // Day 11: the same thread also drains the inbound return channel and
+    // writes validated packets into the adapter's send ring — WintunSession
+    // is !Sync, so every adapter call stays on this one thread.
     let reader_flag = Arc::clone(&shutdown);
     let reader_metrics = Arc::clone(&metrics);
+    let reader_return_metrics = return_metrics.clone();
     let reader_result = tokio::task::block_in_place(|| {
         let mut session = WintunSession::start(&adapter, DEFAULT_RING_CAPACITY)
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
@@ -281,7 +433,14 @@ async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>
         println!("Reading Wintun packets... (Ctrl+C to stop)");
         std::thread::scope(|scope| {
             let handle = scope.spawn(move || {
-                wintun_reader_loop(&mut session, tx, &reader_flag, &reader_metrics);
+                wintun_reader_loop(
+                    &mut session,
+                    tx,
+                    inbound_rx,
+                    &reader_flag,
+                    &reader_metrics,
+                    reader_return_metrics.as_deref(),
+                );
                 // `session` drops here: the Wintun session ends while the
                 // adapter is still alive — the required teardown order.
             });
@@ -305,6 +464,13 @@ async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>
     if let Err(error) = sender.await {
         eprintln!("WARNING: sender task failed: {error}");
     }
+    // Day 11: the return task ends once the shutdown flag is set (it polls
+    // the flag every second); dropping is not needed, just await it.
+    if let Some(task) = return_task
+        && let Err(error) = task.await
+    {
+        eprintln!("WARNING: return receiver task failed: {error}");
+    }
 
     let m = metrics.snapshot();
     println!(
@@ -318,6 +484,23 @@ async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>
         m.invalid_dropped,
         m.backpressure_dropped,
     );
+    if let Some(rm) = return_metrics.as_deref() {
+        let r = rm.snapshot();
+        println!(
+            "return done: packets_received={} bytes_received={} wintun_packets_written={} \
+             wintun_bytes_written={} invalid_protocol={} invalid_session_path={} invalid_ip={} \
+             wintun_write_errors={} backpressure_dropped={}",
+            r.packets_received,
+            r.bytes_received,
+            r.wintun_packets_written,
+            r.wintun_bytes_written,
+            r.invalid_protocol,
+            r.invalid_session_path,
+            r.invalid_ip,
+            r.wintun_write_errors,
+            r.backpressure_dropped,
+        );
+    }
     // `adapter` drops here, after the session already ended above.
     println!("Adapter: closed");
     println!("Exiting cleanly.");
@@ -326,18 +509,41 @@ async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>
 
 /// Blocking Wintun read loop. Runs on its own OS thread — never on a
 /// Tokio executor thread. `session` is `&mut` from this thread only.
+///
+/// Day 11: when `inbound_rx` is `Some`, each iteration first drains the
+/// validated return channel and writes those bytes into the adapter's
+/// send ring. All Wintun calls stay on this thread (`WintunSession` is
+/// `!Sync` by design).
 #[cfg(windows)]
 fn wintun_reader_loop(
     session: &mut bondnet_client::wintun::WintunSession,
     tx: tokio::sync::mpsc::Sender<Vec<u8>>,
+    mut inbound_rx: Option<tokio::sync::mpsc::Receiver<Vec<u8>>>,
     shutdown: &AtomicBool,
     metrics: &bondnet_client::data_plane::DataPlaneMetrics,
+    return_metrics: Option<&bondnet_client::return_path::ReturnMetrics>,
 ) {
     use tokio::sync::mpsc::error::TrySendError;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
+        }
+        // Day 11 return writes: validated bytes → Wintun send ring.
+        if let (Some(rx), Some(rm)) = (inbound_rx.as_mut(), return_metrics) {
+            while let Ok(bytes) = rx.try_recv() {
+                match session.send_packet(&bytes) {
+                    Ok(()) => {
+                        rm.wintun_packets_written.fetch_add(1, Ordering::Relaxed);
+                        rm.wintun_bytes_written
+                            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+                    }
+                    Err(error) => {
+                        rm.wintun_write_errors.fetch_add(1, Ordering::Relaxed);
+                        eprintln!("wintun return write failed: {error}");
+                    }
+                }
+            }
         }
         match session.wait_for_packet(Duration::from_millis(100)) {
             Ok(true) => {
@@ -413,6 +619,15 @@ mod tests {
         assert!(!parsed.synthetic);
         assert_eq!(parsed.synthetic_count, 5);
         assert!(!parsed.verbose);
+        assert!(!parsed.ret);
+    }
+
+    #[test]
+    fn return_flag_parses() {
+        let mut a = full();
+        a.push("--return".to_string());
+        let parsed = parse_tunnel_args(&a).unwrap();
+        assert!(parsed.ret);
     }
 
     #[test]

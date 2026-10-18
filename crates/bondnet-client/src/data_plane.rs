@@ -137,8 +137,12 @@ impl std::error::Error for DataPlaneError {
 /// sender task and the metrics reporter. Sequence numbers come from the
 /// wrapped `UdpPath` — the BondNet tunnel sequence, not a TCP sequence,
 /// not an IP identification field, not a Wintun packet number.
+///
+/// Day 11: the path is shared (`Arc`) with the return-path receiver task,
+/// which calls `UdpPath::recv_packet` on the same socket concurrently.
+/// `tokio::net::UdpSocket` supports concurrent send/recv on `&self`.
 pub struct DataPlane {
-    path: UdpPath,
+    path: Arc<UdpPath>,
     metrics: Arc<DataPlaneMetrics>,
     max_wintun_len: usize,
 }
@@ -146,13 +150,13 @@ pub struct DataPlane {
 impl DataPlane {
     /// Build a data plane over `path` with the default packet budget
     /// ([`MAX_WINTUN_PACKET_LEN`]).
-    pub fn new(path: UdpPath) -> Self {
+    pub fn new(path: Arc<UdpPath>) -> Self {
         Self::with_max_wintun_len(path, MAX_WINTUN_PACKET_LEN)
     }
 
     /// Build a data plane over `path` with an explicit inner-packet
     /// budget. Tests use this to exercise the size gate cheaply.
-    pub fn with_max_wintun_len(path: UdpPath, max_wintun_len: usize) -> Self {
+    pub fn with_max_wintun_len(path: Arc<UdpPath>, max_wintun_len: usize) -> Self {
         Self {
             path,
             metrics: Arc::new(DataPlaneMetrics::default()),
@@ -173,6 +177,16 @@ impl DataPlane {
     /// The configured inner-packet budget in bytes.
     pub fn max_wintun_len(&self) -> usize {
         self.max_wintun_len
+    }
+
+    /// Session ID of the wrapped path (Day 11: for the return processor).
+    pub fn path_session_id(&self) -> u64 {
+        self.path.session_id()
+    }
+
+    /// Path ID of the wrapped path (Day 11: for the return processor).
+    pub fn path_path_id(&self) -> u16 {
+        self.path.path_id()
     }
 
     /// Wrap one inner Layer-3 packet as `PacketType::Data` and send it

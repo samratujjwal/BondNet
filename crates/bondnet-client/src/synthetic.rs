@@ -76,7 +76,10 @@ mod tests {
     fn checksum_detects_corruption() {
         let mut packet = ipv4_udp_test_packet(b"bondnet-day9");
         packet[12] ^= 0xff; // corrupt the source address
-        assert!(!ipv4_checksum_valid(&packet), "checksum must catch corruption");
+        assert!(
+            !ipv4_checksum_valid(&packet),
+            "checksum must catch corruption"
+        );
     }
 
     #[test]

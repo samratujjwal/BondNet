@@ -25,8 +25,19 @@
 //!
 //! runs the Day 9 tunnel smoke test: Wintun → BondNet Data packet → UDP
 //! path → VPS (`--synthetic` skips Wintun and is portable). Not a daemon,
-//! not a service.
+//! not a service, and
+//!
+//! ```text
+//! bondnet-client path-diag --session-id 1001 \
+//!   --path1-id 1 --path1-local 192.168.1.10:0 --path1-remote VPS:51820 \
+//!   --path2-id 2 --path2-local 192.168.2.10:0 --path2-remote VPS:51820
+//! ```
+//!
+//! runs the Day 13 two-path diagnostic: initializes two independent UDP
+//! paths, reports each path's endpoints, sends one PathHello per path,
+//! then shuts down cleanly.
 
+mod path_diag;
 #[cfg(windows)]
 mod smoke;
 mod tunnel_smoke;
@@ -41,6 +52,8 @@ async fn main() {
         run_wintun_smoke(&args).await
     } else if args.get(1).is_some_and(|first| first == "tunnel-smoke") {
         tunnel_smoke::run(&args[2..]).await
+    } else if args.get(1).is_some_and(|first| first == "path-diag") {
+        path_diag::run(&args[2..]).await
     } else {
         run_path_client(&args).await
     };

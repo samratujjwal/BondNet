@@ -17,15 +17,22 @@
 pub mod config;
 pub mod data_plane;
 pub mod error;
+pub mod path_manager;
+pub mod return_path;
 pub mod synthetic;
 pub mod transport;
 pub mod wintun;
 
-pub use config::{UdpPathConfig, parse_args};
+pub use config::{PhysicalPathConfig, UdpPathConfig, parse_args, validate_path_configs};
 pub use data_plane::{
     DATA_PLANE_CHANNEL_CAPACITY, DataPlane, DataPlaneError, DataPlaneMetrics,
     DataPlaneMetricsSnapshot, MAX_WINTUN_PACKET_LEN,
 };
 pub use error::TransportError;
+pub use path_manager::{ManagedPath, PathManager, PathStatus};
+pub use return_path::{
+    RETURN_CHANNEL_CAPACITY, ReturnError, ReturnMetrics, ReturnMetricsSnapshot, ReturnProcessor,
+    WintunWriter,
+};
 pub use synthetic::{ipv4_checksum_valid, ipv4_udp_test_packet};
 pub use transport::{PathStatsSnapshot, UdpPath};

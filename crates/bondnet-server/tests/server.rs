@@ -26,6 +26,7 @@ async fn start_server() -> RunningServer {
     let config = ServerConfig {
         bind_addr: "127.0.0.1:0".parse().unwrap(),
         verbose: false,
+        ..Default::default()
     };
     let server = Arc::new(Server::new(config));
     let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
