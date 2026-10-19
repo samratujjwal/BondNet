@@ -36,6 +36,14 @@ use crate::wintun::WintunError;
 /// (`backpressure_dropped`); memory never grows without bound.
 pub const RETURN_CHANNEL_CAPACITY: usize = 1024;
 
+/// Day 15: maximum out-of-order return packets buffered before Wintun
+/// delivery. Bounds memory; overflow is dropped and counted.
+pub const RETURN_REORDER_BUFFER_SIZE: usize = 256;
+
+/// Day 15: how long a gap in the return sequence may persist before the
+/// reorder buffer skips it (abandoning the missing sequences as loss).
+pub const RETURN_REORDER_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
 /// Live return-path counters. Plain atomics so the UDP receiver task, the
 /// Wintun writer thread, and the shutdown reporter can share them without
 /// locking.
@@ -152,6 +160,8 @@ pub struct ReturnProcessor {
     session_id: u64,
     path_id: u16,
     metrics: Arc<ReturnMetrics>,
+    /// Day 19: optional secure session for decrypting return DATA.
+    secure_session: std::sync::Mutex<Option<std::sync::Arc<bondnet_crypto::SecureSession>>>,
 }
 
 impl ReturnProcessor {
@@ -167,7 +177,13 @@ impl ReturnProcessor {
             session_id,
             path_id,
             metrics,
+            secure_session: std::sync::Mutex::new(None),
         }
+    }
+
+    /// Day 19: attach a secure session for decrypting return DATA.
+    pub fn set_secure_session(&self, session: std::sync::Arc<bondnet_crypto::SecureSession>) {
+        *self.secure_session.lock().expect("secure lock poisoned") = Some(session);
     }
 
     /// Shared live counters.
@@ -222,6 +238,92 @@ impl ReturnProcessor {
             .bytes_received
             .fetch_add(packet.payload.len() as u64, Ordering::Relaxed);
         Ok(&packet.payload)
+    }
+
+    /// Day 19: validate and decrypt a packet (if secure session is set).
+    ///
+    /// Returns the decrypted IP payload as an owned Vec. If no secure
+    /// session is set, behaves like `validate` (returns borrowed data
+    /// as owned).
+    pub fn validate_decrypted(
+        &self,
+        packet: &Packet,
+        datagram: &[u8],
+    ) -> Result<Vec<u8>, ReturnError> {
+        // First, check the header fields (without payload validation).
+        let h = &packet.header;
+        if h.packet_type != PacketType::Data {
+            self.metrics
+                .invalid_protocol
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(ReturnError::WrongType(h.packet_type));
+        }
+        if h.session_id != self.session_id {
+            self.metrics
+                .invalid_session_path
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(ReturnError::WrongSession {
+                expected: self.session_id,
+                got: h.session_id,
+            });
+        }
+        if h.path_id != self.path_id {
+            self.metrics
+                .invalid_session_path
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(ReturnError::WrongPath {
+                expected: self.path_id,
+                got: h.path_id,
+            });
+        }
+
+        // Decrypt if a secure session is set.
+        let payload = if let Some(session) = self
+            .secure_session
+            .lock()
+            .expect("secure lock poisoned")
+            .as_ref()
+        {
+            // AAD is the 36-byte header from the datagram.
+            if datagram.len() < 36 {
+                self.metrics
+                    .invalid_protocol
+                    .fetch_add(1, Ordering::Relaxed);
+                return Err(ReturnError::WrongType(h.packet_type));
+            }
+            let mut aad = [0u8; 36];
+            aad.copy_from_slice(&datagram[..36]);
+            // Use ReturnData domain with sequence as counter.
+            match session.decrypt(
+                bondnet_crypto::KeyDomain::ReturnData,
+                h.sequence,
+                &aad,
+                &packet.payload,
+            ) {
+                Ok(pt) => pt,
+                Err(_) => {
+                    self.metrics
+                        .invalid_protocol
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(ReturnError::WrongType(h.packet_type)); // Reuse error type
+                }
+            }
+        } else {
+            packet.payload.clone()
+        };
+
+        // Validate the (decrypted) IP payload.
+        if let Err(reason) = validate_ip_packet(&payload) {
+            self.metrics.invalid_ip.fetch_add(1, Ordering::Relaxed);
+            return Err(ReturnError::InvalidIp(reason));
+        }
+        self.metrics
+            .packets_received
+            .fetch_add(1, Ordering::Relaxed);
+        self.metrics
+            .bytes_received
+            .fetch_add(payload.len() as u64, Ordering::Relaxed);
+        Ok(payload)
     }
 
     /// Validate one packet and write it through `writer`.

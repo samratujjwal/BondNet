@@ -25,8 +25,10 @@ pub mod aead;
 pub mod constants;
 pub mod error;
 pub mod key;
+pub mod session;
 
 pub use aead::{decrypt, encrypt};
 pub use constants::{KEY_SIZE, NONCE_SIZE, TAG_SIZE};
 pub use error::CryptoError;
 pub use key::{CryptoKey, Nonce};
+pub use session::{KeyDomain, SecureSession};

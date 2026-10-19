@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 bondnet-protocol = { version = "0.1.0", path = "../bondnet-protocol" }
+bondnet-core = { version = "0.1.0", path = "../bondnet-core" }
+bondnet-crypto = { version = "0.1.0", path = "../bondnet-crypto" }
 tokio = { version = "1.53.1", features = ["net", "rt", "rt-multi-thread", "macros", "signal", "time", "sync"] }
 
 # Raw TUN ioctls are Linux-only. Every other platform builds the server

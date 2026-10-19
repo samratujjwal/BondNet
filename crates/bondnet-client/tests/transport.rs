@@ -13,7 +13,6 @@ fn config(path_id: u16, session_id: u64, remote: std::net::SocketAddr) -> UdpPat
         session_id,
         local_addr: "127.0.0.1:0".parse().unwrap(),
         remote_addr: remote,
-        initial_sequence: 100,
     }
 }
 
@@ -39,7 +38,7 @@ async fn path_id_is_preserved() {
     let (_remote, remote_addr) = dummy_remote().await;
     let path = UdpPath::bind(config(7, 1001, remote_addr)).await.unwrap();
     assert_eq!(path.path_id(), 7);
-    let packet = path.next_packet(PacketType::Data, vec![]);
+    let packet = path.next_packet(PacketType::Data, vec![], 42);
     assert_eq!(packet.header.path_id, 7);
 }
 
@@ -49,20 +48,22 @@ async fn session_id_is_preserved() {
     let (_remote, remote_addr) = dummy_remote().await;
     let path = UdpPath::bind(config(1, 1234, remote_addr)).await.unwrap();
     assert_eq!(path.session_id(), 1234);
-    let packet = path.next_packet(PacketType::Data, vec![]);
+    let packet = path.next_packet(PacketType::Data, vec![], 42);
     assert_eq!(packet.header.session_id, 1234);
 }
 
-/// Test 4 — sequences are monotonic with no duplicates.
+/// Test 4 — caller-supplied sequence lands in the packet header.
+///
+/// Day 15: the sequence is the session-wide logical order, allocated by
+/// the data plane — the path only carries it.
 #[tokio::test]
-async fn sequence_increments_monotonically() {
+async fn sequence_is_caller_supplied() {
     let (_remote, remote_addr) = dummy_remote().await;
     let path = UdpPath::bind(config(1, 1001, remote_addr)).await.unwrap();
-    let mut seen = Vec::new();
-    for _ in 0..4 {
-        seen.push(path.next_packet(PacketType::Data, vec![]).header.sequence);
-    }
-    assert_eq!(seen, vec![100, 101, 102, 103]);
+    let packet = path.next_packet(PacketType::Data, vec![], 999);
+    assert_eq!(packet.header.sequence, 999);
+    let packet2 = path.next_packet(PacketType::Data, vec![], 1000);
+    assert_eq!(packet2.header.sequence, 1000);
 }
 
 /// Test 5 — a packet sent through the transport arrives intact.
@@ -74,7 +75,7 @@ async fn localhost_send_receive_round_trip() {
 
     let payload = b"day7-round-trip".to_vec();
     let sent_seq = path
-        .send_new(PacketType::Data, payload.clone())
+        .send_new(PacketType::Data, payload.clone(), 77)
         .await
         .unwrap();
 
@@ -94,22 +95,20 @@ async fn localhost_send_receive_round_trip() {
     assert_eq!(stats.last_sequence_sent, Some(sent_seq));
 }
 
-/// Test 6 — two logical paths keep independent IDs and sequences.
+/// Test 6 — two logical paths carry caller-supplied sequences.
+///
+/// Day 15: sequences are session-wide, not per-path. Both paths carry
+/// whatever sequence the data plane allocates.
 #[tokio::test]
-async fn multiple_logical_paths_are_independent() {
+async fn multiple_logical_paths_carry_session_sequences() {
     let (_remote, remote_addr) = dummy_remote().await;
     let path1 = UdpPath::bind(config(1, 1001, remote_addr)).await.unwrap();
     let path2 = UdpPath::bind(config(2, 1001, remote_addr)).await.unwrap();
 
-    let p1 = path1.next_packet(PacketType::Data, vec![]);
-    let p2 = path2.next_packet(PacketType::Data, vec![]);
-    assert_eq!((p1.header.path_id, p1.header.sequence), (1, 100));
-    assert_eq!((p2.header.path_id, p2.header.sequence), (2, 100));
-
-    let p1b = path1.next_packet(PacketType::Data, vec![]);
-    assert_eq!(p1b.header.sequence, 101);
-    // This proves the abstraction supports multiple logical path IDs.
-    // It does NOT prove two physical Internet links exist.
+    let p1 = path1.next_packet(PacketType::Data, vec![], 5);
+    let p2 = path2.next_packet(PacketType::Data, vec![], 6);
+    assert_eq!((p1.header.path_id, p1.header.sequence), (1, 5));
+    assert_eq!((p2.header.path_id, p2.header.sequence), (2, 6));
 }
 
 /// Test 7 — malformed datagrams fail decode but leave the path usable.
@@ -132,7 +131,10 @@ async fn malformed_receive_does_not_kill_path() {
     );
 
     // Path still works: a valid packet round-trips afterwards.
-    let seq = path.send_new(PacketType::PathHello, vec![]).await.unwrap();
+    let seq = path
+        .send_new(PacketType::PathHello, vec![], 100)
+        .await
+        .unwrap();
     assert_eq!(seq, 100);
     let stats = path.stats();
     assert_eq!(stats.packets_sent, 1);

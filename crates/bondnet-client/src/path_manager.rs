@@ -14,6 +14,7 @@ use std::sync::Arc;
 
 use crate::config::{PhysicalPathConfig, validate_path_configs};
 use crate::transport::UdpPath;
+use bondnet_scheduler::{PathHealth, PathId, PathState, PathStats};
 
 /// One configured path and its runtime state.
 pub struct ManagedPath {
@@ -26,6 +27,11 @@ pub struct ManagedPath {
     /// Why binding failed, if it did. `None` means "not attempted" or
     /// "succeeded"; check `path` to distinguish.
     pub init_error: Option<String>,
+    /// Operator-controlled health for scheduler eligibility. Starts
+    /// `Healthy` on successful init; the scheduler excludes `Unhealthy`
+    /// paths. Day 14: send errors increment metrics only — they do NOT
+    /// auto-mark a path unhealthy (no automatic failover yet).
+    pub health: PathHealth,
 }
 
 /// Read-only snapshot of one path's status, for diagnostics.
@@ -61,6 +67,7 @@ impl PathManager {
                     config,
                     path: None,
                     init_error: None,
+                    health: PathHealth::Healthy,
                 })
                 .collect(),
         })
@@ -80,7 +87,7 @@ impl PathManager {
             if managed.path.is_some() {
                 continue;
             }
-            let udp_config = managed.config.to_udp_path_config(session_id, 1);
+            let udp_config = managed.config.to_udp_path_config(session_id);
             match UdpPath::bind(udp_config).await {
                 Ok(path) => {
                     managed.path = Some(Arc::new(path));
@@ -136,6 +143,42 @@ impl PathManager {
         }
     }
 
+    /// Set a path's health for scheduler eligibility. Returns false if the
+    /// path ID is unknown. This is operator-controlled in Day 14; send
+    /// errors do NOT change health automatically.
+    pub fn set_health(&mut self, path_id: u16, health: PathHealth) -> bool {
+        if let Some(managed) = self.paths.iter_mut().find(|m| m.config.path_id == path_id) {
+            managed.health = health;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Build the scheduler state for all initialized paths. Each gets a
+    /// `PathState` with its current health and static bandwidth weight
+    /// (Day 14: no active probing; weights are configured, not measured).
+    pub fn scheduler_states(&self) -> Vec<(PathState, bool)> {
+        self.paths
+            .iter()
+            .map(|managed| {
+                let state = PathState::new(
+                    PathId::new(managed.config.path_id),
+                    managed.health,
+                    PathStats::new(
+                        managed.config.bandwidth_bps,
+                        0, // rtt_ms: unknown
+                        0, // loss_ppm: unknown
+                        0, // jitter_ms: unknown
+                        0, // in_flight_bytes: not tracked yet
+                        0, // capacity_bytes: unknown
+                    ),
+                );
+                (state, managed.path.is_some())
+            })
+            .collect()
+    }
+
     /// Number of configured paths (enabled or not).
     pub fn len(&self) -> usize {
         self.paths.len()
@@ -158,6 +201,7 @@ mod tests {
             path_id: id,
             local_addr: "127.0.0.1:0".parse().unwrap(),
             remote_addr: "127.0.0.1:51820".parse().unwrap(),
+            bandwidth_bps: crate::config::DEFAULT_BANDWIDTH_BPS,
             enabled,
         }
     }
@@ -227,31 +271,16 @@ mod tests {
         manager.initialize(1001).await;
         let pa = manager.get(1).unwrap();
         let pb = manager.get(2).unwrap();
-        // next_packet is pure (no I/O): it stamps the next sequence from
-        // each path's independent counter. Send 3 on A, 1 on B.
-        let mut last_a = 0;
-        for _ in 0..3 {
-            last_a = pa
-                .next_packet(PacketType::PathHello, Vec::new())
-                .header
-                .sequence;
-        }
-        let last_b = pb
-            .next_packet(PacketType::PathHello, Vec::new())
-            .header
-            .sequence;
-        // Independent counters: A is at 3, B is at 1. Neither affects the
-        // other, and both carry the right path IDs.
-        assert_eq!(last_a, 3);
-        assert_eq!(last_b, 1);
-        let pa2 = pa.next_packet(PacketType::PathHello, Vec::new());
-        let pb2 = pb.next_packet(PacketType::PathHello, Vec::new());
-        assert_eq!(pa2.header.sequence, 4);
-        assert_eq!(pb2.header.sequence, 2);
-        assert_eq!(pa2.header.path_id, 1);
-        assert_eq!(pb2.header.path_id, 2);
-        assert_eq!(pa2.header.session_id, 1001);
-        assert_eq!(pb2.header.session_id, 1001);
+        // Day 15: next_packet is pure (no I/O) and stamps the
+        // caller-supplied session-wide sequence. The path never allocates.
+        let pa1 = pa.next_packet(PacketType::PathHello, Vec::new(), 10);
+        let pb1 = pb.next_packet(PacketType::PathHello, Vec::new(), 11);
+        assert_eq!(pa1.header.sequence, 10);
+        assert_eq!(pb1.header.sequence, 11);
+        assert_eq!(pa1.header.path_id, 1);
+        assert_eq!(pb1.header.path_id, 2);
+        assert_eq!(pa1.header.session_id, 1001);
+        assert_eq!(pb1.header.session_id, 1001);
     }
 
     #[tokio::test]

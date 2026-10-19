@@ -14,21 +14,31 @@
 //! Like the Day 6 server, this transport is intentionally unencrypted.
 //! Development use only — do not send secrets or sensitive data through it.
 
+pub mod bench;
 pub mod config;
 pub mod data_plane;
 pub mod error;
+pub mod health;
+pub mod health_diag;
+pub mod health_monitor;
+pub mod multipath;
 pub mod path_manager;
 pub mod return_path;
 pub mod synthetic;
 pub mod transport;
 pub mod wintun;
 
-pub use config::{PhysicalPathConfig, UdpPathConfig, parse_args, validate_path_configs};
+pub use config::{
+    DEFAULT_BANDWIDTH_BPS, PhysicalPathConfig, UdpPathConfig, parse_args, validate_path_configs,
+};
 pub use data_plane::{
     DATA_PLANE_CHANNEL_CAPACITY, DataPlane, DataPlaneError, DataPlaneMetrics,
     DataPlaneMetricsSnapshot, MAX_WINTUN_PACKET_LEN,
 };
 pub use error::TransportError;
+pub use multipath::{
+    MultipathDataPlane, MultipathError, MultipathMetrics, MultipathMetricsSnapshot,
+};
 pub use path_manager::{ManagedPath, PathManager, PathStatus};
 pub use return_path::{
     RETURN_CHANNEL_CAPACITY, ReturnError, ReturnMetrics, ReturnMetricsSnapshot, ReturnProcessor,

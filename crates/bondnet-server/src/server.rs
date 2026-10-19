@@ -53,6 +53,7 @@ use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
+use bondnet_core::ordered::OrderedReceiver;
 use bondnet_protocol::{
     HEADER_LEN, MAX_PAYLOAD_LEN, PROTOCOL_VERSION, Packet, PacketHeader, PacketType,
 };
@@ -77,6 +78,15 @@ pub const RECV_BUF_LEN: usize = HEADER_LEN + MAX_PAYLOAD_LEN;
 /// `tun_queue_dropped` counts it (same drop-newest policy as Day 9's
 /// Wintun→Tokio boundary).
 pub const TUN_QUEUE_CAPACITY: usize = 1024;
+
+/// Day 15: maximum out-of-order packets buffered per session before
+/// the TUN writer. Bounds memory; overflow is dropped and counted.
+pub const UPLOAD_REORDER_BUFFER_SIZE: usize = 256;
+
+/// Day 15: how long a gap in the upload sequence may persist before the
+/// reorder buffer skips it (abandoning the missing sequences as loss).
+/// Prevents a permanently lost packet from blocking delivery forever.
+pub const UPLOAD_REORDER_TIMEOUT: Duration = Duration::from_millis(200);
 
 /// Server-wide counters. Atomics so tests (and future admin endpoints) can
 /// read them without stopping the receive loop.
@@ -104,6 +114,23 @@ pub struct ServerStats {
     pub tun_write_errors: AtomicU64,
     /// Day 10: validated packets dropped because the TUN queue was full.
     pub tun_queue_dropped: AtomicU64,
+    /// Day 15: upload packets delivered in order to the TUN queue.
+    pub upload_ordered_delivered: AtomicU64,
+    /// Day 15: upload sequence gaps observed (missing sequences).
+    pub upload_gaps: AtomicU64,
+    /// Day 15: upload gaps skipped due to timeout (abandoned as loss).
+    pub upload_gap_timeouts: AtomicU64,
+    /// Day 15: duplicate upload packets dropped.
+    pub upload_duplicates_dropped: AtomicU64,
+    /// Day 15: late upload packets (below expected) dropped.
+    pub upload_late_dropped: AtomicU64,
+    /// Day 15: upload packets dropped due to reorder buffer overflow.
+    pub upload_overflow_dropped: AtomicU64,
+    /// Day 17: PathKeepalive echo send failures.
+    pub keepalive_echo_errors: AtomicU64,
+    /// Day 18: DATA packets that failed authentication (dropped before
+    /// affecting session state).
+    pub auth_failures: AtomicU64,
     /// Day 10: packets read back from the TUN device (Day 11 return path;
     /// the reader is not wired up yet, so this stays 0).
     pub tun_packets_read: AtomicU64,
@@ -150,6 +177,14 @@ pub struct StatsSnapshot {
     pub tun_write_errors: u64,
     /// Day 10: packets dropped on a full TUN queue.
     pub tun_queue_dropped: u64,
+    pub upload_ordered_delivered: u64,
+    pub upload_gaps: u64,
+    pub upload_gap_timeouts: u64,
+    pub upload_duplicates_dropped: u64,
+    pub upload_late_dropped: u64,
+    pub upload_overflow_dropped: u64,
+    pub keepalive_echo_errors: u64,
+    pub auth_failures: u64,
     /// Day 10: packets read from TUN (Day 11; currently always 0).
     pub tun_packets_read: u64,
     /// Day 10: bytes read from TUN (Day 11; currently always 0).
@@ -184,6 +219,14 @@ impl ServerStats {
             tun_invalid_ip: self.tun_invalid_ip.load(Ordering::Relaxed),
             tun_write_errors: self.tun_write_errors.load(Ordering::Relaxed),
             tun_queue_dropped: self.tun_queue_dropped.load(Ordering::Relaxed),
+            upload_ordered_delivered: self.upload_ordered_delivered.load(Ordering::Relaxed),
+            upload_gaps: self.upload_gaps.load(Ordering::Relaxed),
+            upload_gap_timeouts: self.upload_gap_timeouts.load(Ordering::Relaxed),
+            upload_duplicates_dropped: self.upload_duplicates_dropped.load(Ordering::Relaxed),
+            upload_late_dropped: self.upload_late_dropped.load(Ordering::Relaxed),
+            upload_overflow_dropped: self.upload_overflow_dropped.load(Ordering::Relaxed),
+            keepalive_echo_errors: self.keepalive_echo_errors.load(Ordering::Relaxed),
+            auth_failures: self.auth_failures.load(Ordering::Relaxed),
             tun_packets_read: self.tun_packets_read.load(Ordering::Relaxed),
             tun_bytes_read: self.tun_bytes_read.load(Ordering::Relaxed),
             tun_read_errors: self.tun_read_errors.load(Ordering::Relaxed),
@@ -209,16 +252,6 @@ struct PathState {
     packets_received: u64,
     bytes_received: u64,
     last_sequence: u64,
-    /// Day 11: next tunnel sequence number for the RETURN direction
-    /// (server → client) on this path.
-    ///
-    /// This is a *directional* sequence space, independent of the client's
-    /// outbound counter for the same `(session_id, path_id)`: the client
-    /// stamps its Wintun→UDP packets, the server stamps its TUN→UDP
-    /// packets. A receiver distinguishes direction by arrival interface
-    /// (UDP socket vs. TUN/Wintun), never by comparing sequence numbers
-    /// across directions. No wrap-around handling yet.
-    return_sequence: u64,
 }
 
 /// What the server remembers about one observed `session_id`.
@@ -227,6 +260,17 @@ struct SessionState {
     last_seen: Instant,
     packets_received: u64,
     paths: HashMap<u16, PathState>,
+    /// Day 15: next tunnel sequence number for the RETURN direction
+    /// (server → client) for this session.
+    ///
+    /// This is a *directional* sequence space, independent of the client's
+    /// outbound counter: the client stamps its Wintun→UDP packets from its
+    /// session-wide upload counter, the server stamps its TUN→UDP packets
+    /// from this session-wide return counter. A receiver distinguishes
+    /// direction by arrival interface (UDP socket vs. TUN/Wintun), never
+    /// by comparing sequence numbers across directions. No wrap-around
+    /// handling yet (u64 space).
+    return_sequence: u64,
 }
 
 /// Plain-data copy of one observed path, for tests and future inspection.
@@ -303,12 +347,27 @@ pub struct Server {
     tun_reader: Mutex<Option<JoinHandle<()>>>,
     /// Day 11: shutdown flag for the reader thread.
     reader_shutdown: Mutex<Option<Arc<AtomicBool>>>,
+    /// Day 15: per-session ordered receivers for upload traffic. Each
+    /// session gets an `OrderedReceiver` that buffers out-of-order DATA
+    /// packets and releases them contiguously by logical sequence before
+    /// they reach the TUN writer queue.
+    upload_order: Mutex<HashMap<u64, OrderedReceiver<Vec<u8>>>>,
+    /// Day 18: pre-shared key for authenticated encryption. `None` =
+    /// plaintext mode.
+    psk: Option<bondnet_crypto::CryptoKey>,
+    /// Day 18: derived secure sessions, keyed by session_id. Created
+    /// on-demand from the PSK when the first packet of a session arrives.
+    secure_sessions: Mutex<HashMap<u64, bondnet_crypto::SecureSession>>,
+    /// Day 19: session salts from PathHello, keyed by session_id.
+    /// The client sends a 32-byte random salt in PathHello payload.
+    session_salts: Mutex<HashMap<u64, [u8; 32]>>,
 }
 
 impl Server {
     /// Create a server from configuration. Does not bind yet; see
     /// [`run`](Self::run) and [`run_on`](Self::run_on).
     pub fn new(config: ServerConfig) -> Self {
+        let psk = config.psk.clone();
         Self {
             config,
             stats: Arc::new(ServerStats::default()),
@@ -321,6 +380,10 @@ impl Server {
             return_task: Mutex::new(None),
             tun_reader: Mutex::new(None),
             reader_shutdown: Mutex::new(None),
+            upload_order: Mutex::new(HashMap::new()),
+            psk,
+            secure_sessions: Mutex::new(HashMap::new()),
+            session_salts: Mutex::new(HashMap::new()),
         }
     }
 
@@ -522,6 +585,13 @@ impl Server {
     // pieces, not a `&Server`).
     fn process_return_packet(&self, ip_packet: &[u8]) -> Option<ReturnDatagram> {
         let (session_id, path_id) = self.return_association()?;
+        // Day 19: get the secure session for return encryption (if PSK set).
+        let session = self
+            .secure_sessions
+            .lock()
+            .expect("sessions lock poisoned")
+            .get(&session_id)
+            .cloned();
         build_return_datagram(
             &self.registry,
             &self.stats,
@@ -530,6 +600,7 @@ impl Server {
             Duration::from_secs(self.config.tun_return_max_age_secs),
             self.config.verbose,
             ip_packet,
+            session.as_ref(),
         )
     }
 
@@ -707,6 +778,23 @@ impl Server {
         };
 
         self.stats.valid_packets.fetch_add(1, Ordering::Relaxed);
+
+        // Day 18: authenticate and decrypt DATA packets BEFORE they can
+        // affect session state. An unauthenticated packet must not be
+        // able to hijack a return endpoint via record_packet.
+        let packet = if packet.header.packet_type == PacketType::Data {
+            match self.authenticate_data(packet, datagram) {
+                Some(p) => p,
+                None => {
+                    // Authentication failed: drop without touching registry.
+                    self.stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+            }
+        } else {
+            packet
+        };
+
         // Day 9: observe Data packets for the tunnel proof. Counting only,
         // unless Day 10 TUN forwarding is enabled (see forward_to_tun).
         if packet.header.packet_type == PacketType::Data {
@@ -715,6 +803,27 @@ impl Server {
                 .data_bytes
                 .fetch_add(packet.payload.len() as u64, Ordering::Relaxed);
         }
+
+        // Day 19: extract session salt from PathHello (first 32 bytes of
+        // payload). The salt ensures fresh keys per client restart.
+        if packet.header.packet_type == PacketType::PathHello
+            && self.psk.is_some()
+            && packet.payload.len() >= 32
+        {
+            let mut salt = [0u8; 32];
+            salt.copy_from_slice(&packet.payload[..32]);
+            self.session_salts
+                .lock()
+                .expect("salts lock poisoned")
+                .insert(packet.header.session_id, salt);
+            // Invalidate any cached session (keys must be re-derived
+            // with the new salt).
+            self.secure_sessions
+                .lock()
+                .expect("sessions lock poisoned")
+                .remove(&packet.header.session_id);
+        }
+
         self.record_packet(&packet, datagram.len(), remote);
 
         if self.config.verbose {
@@ -747,6 +856,126 @@ impl Server {
         // Day 10: forward validated Data payloads toward the TUN device.
         // No-op unless --tun-name was given.
         self.forward_to_tun(&packet);
+
+        // Day 17: echo PathKeepalive probes back to the sender. The payload
+        // is the probe ID (u64); we echo it unchanged so the client can
+        // correlate the response. This does NOT go through the DATA
+        // pipeline or the reorder buffer.
+        if packet.header.packet_type == PacketType::PathKeepalive {
+            self.echo_keepalive(&packet, remote);
+        }
+    }
+
+    /// Day 17: send a PathKeepalive echo response to the probe sender.
+    ///
+    /// Day 18: authenticate and decrypt a DATA packet.
+    ///
+    /// If no PSK is configured, returns the packet unchanged (plaintext
+    /// mode). If a PSK is configured, derives the session keys (caching
+    /// by session_id) and decrypts the payload. Returns `None` if
+    /// authentication fails — the packet must then be dropped without
+    /// affecting session state.
+    ///
+    /// The header (36 bytes) is used as AAD, authenticating packet_type,
+    /// session_id, path_id, sequence, and payload_len.
+    fn authenticate_data(&self, packet: Packet, datagram: &[u8]) -> Option<Packet> {
+        let psk = match &self.psk {
+            Some(k) => k,
+            None => return Some(packet), // Plaintext mode.
+        };
+
+        let session_id = packet.header.session_id;
+        let sequence = packet.header.sequence;
+
+        // Get or derive the secure session for this session_id.
+        // Day 19: use the cached salt from PathHello (or zeros if not
+        // yet received — backward compatible but less safe).
+        let salt = {
+            self.session_salts
+                .lock()
+                .expect("salts lock poisoned")
+                .get(&session_id)
+                .cloned()
+                .unwrap_or([0u8; 32])
+        };
+        let session = {
+            let mut sessions = self.secure_sessions.lock().expect("sessions lock poisoned");
+            use std::collections::hash_map::Entry;
+            match sessions.entry(session_id) {
+                Entry::Occupied(e) => e.get().clone(),
+                Entry::Vacant(e) => {
+                    let s = match bondnet_crypto::SecureSession::new(psk, session_id, salt) {
+                        Ok(s) => s,
+                        Err(_) => return None,
+                    };
+                    e.insert(s).clone()
+                }
+            }
+        };
+
+        // The AAD is the 36-byte header from the original datagram.
+        if datagram.len() < bondnet_protocol::HEADER_LEN {
+            return None;
+        }
+        let mut aad = [0u8; 36];
+        aad.copy_from_slice(&datagram[..36]);
+
+        // Decrypt the payload.
+        // Day 19: use KeyDomain::UploadData with sequence as counter.
+        match session.decrypt(
+            bondnet_crypto::KeyDomain::UploadData,
+            sequence,
+            &aad,
+            &packet.payload,
+        ) {
+            Ok(plaintext) => Some(Packet {
+                header: packet.header,
+                payload: plaintext,
+            }),
+            Err(_) => None,
+        }
+    }
+
+    /// The response has the same session_id, path_id, and payload (probe
+    /// ID) as the request, with a fresh sequence number (0 = control).
+    /// Sent via `send_to` on the shared UDP socket; failures are counted
+    /// but not retried.
+    fn echo_keepalive(&self, request: &Packet, remote: SocketAddr) {
+        let socket = match self
+            .udp_socket
+            .lock()
+            .expect("socket lock poisoned")
+            .clone()
+        {
+            Some(s) => s,
+            None => return,
+        };
+        let response = Packet {
+            header: PacketHeader {
+                version: PROTOCOL_VERSION,
+                flags: 0,
+                session_id: request.header.session_id,
+                sequence: 0, // Control packets don't use the ordered sequence.
+                path_id: request.header.path_id,
+                packet_type: PacketType::PathKeepalive,
+                timestamp: request.header.timestamp,
+            },
+            payload: request.payload.clone(),
+        };
+        let bytes = match response.encode() {
+            Ok(b) => b,
+            Err(_) => return,
+        };
+        let stats = Arc::clone(&self.stats);
+        let verbose = self.config.verbose;
+        tokio::spawn(async move {
+            if let Err(e) = socket.send_to(&bytes, remote).await {
+                stats.keepalive_echo_errors.fetch_add(1, Ordering::Relaxed);
+                if verbose {
+                    eprintln!("WARN keepalive echo to {remote} failed: {e}");
+                }
+            }
+        });
     }
 
     /// Day 10 forward gate: `Data` → IP validation → bounded TUN queue.
@@ -775,21 +1004,70 @@ impl Server {
             }
             return;
         }
-        match tx.try_send(packet.payload.clone()) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                // Backpressure policy: drop the newest packet, count it.
-                // The queue is bounded so memory stays flat under load.
-                self.stats.tun_queue_dropped.fetch_add(1, Ordering::Relaxed);
-                if self.config.verbose {
-                    println!(
-                        "TUN_DROP session={} path={} seq={} reason=queue-full",
-                        h.session_id, h.path_id, h.sequence,
-                    );
+        // Day 15: ordered delivery. The packet has passed all validation
+        // gates; now it enters the per-session reorder buffer keyed by
+        // the logical sequence. Only contiguous packets are forwarded to
+        // the TUN queue, in order.
+        let released = {
+            let mut order = self.upload_order.lock().expect("order lock poisoned");
+            let receiver = order.entry(h.session_id).or_insert_with(|| {
+                OrderedReceiver::new(1, UPLOAD_REORDER_BUFFER_SIZE, UPLOAD_REORDER_TIMEOUT)
+            });
+            // Snapshot before, to compute deltas for server stats.
+            let before = receiver.metrics_snapshot();
+            // Check for stale gaps before pushing (timeout policy).
+            let mut out = receiver.check_timeout();
+            out.extend(receiver.push(h.sequence, packet.payload.clone()));
+            let after = receiver.metrics_snapshot();
+            // Fold deltas into server-wide stats.
+            self.stats.upload_ordered_delivered.fetch_add(
+                after.packets_delivered - before.packets_delivered,
+                Ordering::Relaxed,
+            );
+            self.stats.upload_gaps.fetch_add(
+                after.gaps_observed - before.gaps_observed,
+                Ordering::Relaxed,
+            );
+            self.stats
+                .upload_gap_timeouts
+                .fetch_add(after.gap_timeouts - before.gap_timeouts, Ordering::Relaxed);
+            self.stats.upload_duplicates_dropped.fetch_add(
+                after.duplicates_dropped - before.duplicates_dropped,
+                Ordering::Relaxed,
+            );
+            self.stats
+                .upload_late_dropped
+                .fetch_add(after.late_dropped - before.late_dropped, Ordering::Relaxed);
+            self.stats.upload_overflow_dropped.fetch_add(
+                after.overflow_dropped - before.overflow_dropped,
+                Ordering::Relaxed,
+            );
+            out
+        };
+        for payload in released {
+            match tx.try_send(payload) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Backpressure policy: drop the newest packet, count it.
+                    // The queue is bounded so memory stays flat under load.
+                    self.stats.tun_queue_dropped.fetch_add(1, Ordering::Relaxed);
+                    if self.config.verbose {
+                        println!(
+                            "TUN_DROP session={} path={} reason=queue-full",
+                            h.session_id, h.path_id,
+                        );
+                    }
                 }
-            }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                self.stats.tun_write_errors.fetch_add(1, Ordering::Relaxed);
+                Err(mpsc::error::TrySendError::Closed(_)) => {
+                    self.stats.tun_write_errors.fetch_add(1, Ordering::Relaxed);
+                    if self.config.verbose {
+                        println!(
+                            "TUN_DROP session={} path={} reason=queue-closed",
+                            h.session_id, h.path_id,
+                        );
+                    }
+                    return;
+                }
             }
         }
     }
@@ -806,6 +1084,7 @@ impl Server {
                 last_seen: now,
                 packets_received: 0,
                 paths: HashMap::new(),
+                return_sequence: 1,
             });
         session.last_seen = now;
         session.packets_received += 1;
@@ -815,9 +1094,13 @@ impl Server {
             packets_received: 0,
             bytes_received: 0,
             last_sequence: h.sequence,
-            return_sequence: 1,
         });
-        path.remote_addr = remote;
+        // Day 17: only DATA and PathHello update the return-path address.
+        // PathKeepalive probes may come from a dedicated health-check
+        // socket; they must not overwrite the DATA socket's address.
+        if h.packet_type == PacketType::Data || h.packet_type == PacketType::PathHello {
+            path.remote_addr = remote;
+        }
         path.last_seen = now;
         path.packets_received += 1;
         path.bytes_received += len as u64;
@@ -874,6 +1157,7 @@ fn tun_writer_loop(
 /// successfully decoded inbound packets update the registry (via
 /// `record_packet`), so a bad TUN-read packet cannot overwrite the trusted
 /// association.
+#[allow(clippy::too_many_arguments)]
 fn build_return_datagram(
     registry: &Mutex<HashMap<u64, SessionState>>,
     stats: &ServerStats,
@@ -882,6 +1166,7 @@ fn build_return_datagram(
     max_age: Duration,
     verbose: bool,
     ip_packet: &[u8],
+    secure_session: Option<&bondnet_crypto::SecureSession>,
 ) -> Option<ReturnDatagram> {
     if let Err(reason) = validate_ip_packet(ip_packet) {
         stats.return_invalid_ip.fetch_add(1, Ordering::Relaxed);
@@ -894,16 +1179,33 @@ fn build_return_datagram(
         return None;
     }
     let mut registry = registry.lock().expect("registry lock poisoned");
-    let path = registry
-        .get_mut(&session_id)
-        .and_then(|session| session.paths.get_mut(&path_id));
-    let (remote, sequence) = match path {
-        Some(path) if path.last_seen.elapsed() <= max_age => {
-            let sequence = path.return_sequence;
-            path.return_sequence = path.return_sequence.wrapping_add(1);
-            (path.remote_addr, sequence)
+    // Day 15: the return sequence is session-wide, allocated here before
+    // the path is chosen. The path still identifies which observed
+    // endpoint receives the packet.
+    let session = registry.get_mut(&session_id);
+    let (remote, sequence) = match session {
+        Some(session) => {
+            let path = session.paths.get(&path_id);
+            match path {
+                Some(path) if path.last_seen.elapsed() <= max_age => {
+                    let sequence = session.return_sequence;
+                    session.return_sequence = session.return_sequence.wrapping_add(1);
+                    (path.remote_addr, sequence)
+                }
+                _ => {
+                    drop(registry);
+                    stats.return_no_endpoint.fetch_add(1, Ordering::Relaxed);
+                    if verbose {
+                        println!(
+                            "RETURN_NO_ENDPOINT session={session_id} path={path_id} \
+                             reason=unknown-or-expired-association"
+                        );
+                    }
+                    return None;
+                }
+            }
         }
-        _ => {
+        None => {
             drop(registry);
             stats.return_no_endpoint.fetch_add(1, Ordering::Relaxed);
             if verbose {
@@ -916,18 +1218,51 @@ fn build_return_datagram(
         }
     };
     drop(registry);
-    let packet = Packet {
-        header: PacketHeader {
-            version: PROTOCOL_VERSION,
-            flags: 0,
-            session_id,
-            sequence,
-            path_id,
-            packet_type: PacketType::Data,
-            timestamp: unix_millis(),
-        },
-        payload: ip_packet.to_vec(),
+    // Day 19: build the header once (timestamp must match AAD).
+    let header = PacketHeader {
+        version: PROTOCOL_VERSION,
+        flags: 0,
+        session_id,
+        sequence,
+        path_id,
+        packet_type: PacketType::Data,
+        timestamp: unix_millis(),
     };
+    // Encrypt the payload if a secure session is available.
+    // Uses KeyDomain::ReturnData with sequence as the nonce counter.
+    let payload = if let Some(session) = secure_session {
+        let ciphertext_len = ip_packet.len() + bondnet_crypto::TAG_SIZE;
+        let aad = {
+            let mut out = [0u8; 36];
+            out[0..2].copy_from_slice(&bondnet_protocol::MAGIC);
+            out[2] = header.version;
+            out[3] = header.flags;
+            out[4..6].copy_from_slice(&(36u16).to_be_bytes());
+            out[6..14].copy_from_slice(&header.session_id.to_be_bytes());
+            out[14..22].copy_from_slice(&header.sequence.to_be_bytes());
+            out[22..24].copy_from_slice(&header.path_id.to_be_bytes());
+            out[24] = header.packet_type.as_u8();
+            out[25] = 0;
+            out[26..34].copy_from_slice(&header.timestamp.to_be_bytes());
+            out[34..36].copy_from_slice(&(ciphertext_len as u16).to_be_bytes());
+            out
+        };
+        match session.encrypt_with_counter(
+            bondnet_crypto::KeyDomain::ReturnData,
+            sequence,
+            &aad,
+            ip_packet,
+        ) {
+            Ok(ct) => ct,
+            Err(_) => {
+                stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        }
+    } else {
+        ip_packet.to_vec()
+    };
+    let packet = Packet { header, payload };
     match packet.encode() {
         Ok(bytes) => {
             if verbose {
@@ -1058,6 +1393,9 @@ fn tun_reader_loop(
                     max_age,
                     verbose,
                     &buf[..n],
+                    None, // Day 19: TUN reader thread does not yet support
+                          // encryption. Use process_return_packet for
+                          // encrypted returns (tested path).
                 ) && !enqueue_return_datagram(
                     &return_tx, datagram, &stats, verbose, session_id, path_id,
                 ) {
@@ -1154,7 +1492,9 @@ mod tests {
     fn valid_ipv4_data_reaches_tun_queue_unchanged() {
         let (server, mut rx) = server_with_queue(16);
         let payload = ipv4_min();
-        let datagram = encode_packet(1001, 1, 42, PacketType::Data, payload.clone());
+        // Day 15: the reorder buffer expects sequence 1 first. In-order
+        // packets are delivered immediately.
+        let datagram = encode_packet(1001, 1, 1, PacketType::Data, payload.clone());
         server.handle_datagram(&datagram, remote());
         let queued = rx.try_recv().expect("validated packet must be queued");
         assert_eq!(queued, payload, "TUN must receive the exact payload bytes");
@@ -1168,7 +1508,8 @@ mod tests {
         let (server, mut rx) = server_with_queue(16);
         let mut payload = vec![0u8; 40];
         payload[0] = 0x60; // version 6, payload length 0
-        let datagram = encode_packet(1001, 1, 7, PacketType::Data, payload.clone());
+        // Day 15: sequence 1 for in-order delivery.
+        let datagram = encode_packet(1001, 1, 1, PacketType::Data, payload.clone());
         server.handle_datagram(&datagram, remote());
         assert_eq!(rx.try_recv().unwrap(), payload);
     }
@@ -1219,7 +1560,8 @@ mod tests {
             .unwrap()
             .try_send(vec![0xaa])
             .unwrap();
-        let datagram = encode_packet(1001, 1, 9, PacketType::Data, ipv4_min());
+        // Day 15: sequence 1 for in-order delivery.
+        let datagram = encode_packet(1001, 1, 1, PacketType::Data, ipv4_min());
         server.handle_datagram(&datagram, remote());
         assert_eq!(server.stats().tun_queue_dropped, 1);
         // The pre-existing item is untouched; the new packet was dropped.
@@ -1283,7 +1625,8 @@ mod tests {
     }
 
     #[test]
-    fn return_sequence_increments_per_path() {
+    fn return_sequence_increments_per_session() {
+        // Day 15: the return sequence is session-wide, not per-path.
         let server = server_with_endpoint(1001, 1);
         let payload = ipv4_min();
         let seq1 = Packet::decode(&server.process_return_packet(&payload).unwrap().1)
@@ -1298,18 +1641,29 @@ mod tests {
     }
 
     #[test]
-    fn return_sequences_are_independent_per_path() {
+    fn return_sequences_are_shared_per_session() {
+        // Day 15: the return sequence is session-wide. Both paths draw
+        // from the same counter; the path_id still identifies which
+        // observed endpoint receives the packet.
         let server = server_with_return(1001, 1, 300);
         for path_id in [1u16, 2] {
             let datagram = encode_packet(1001, path_id, 0, PacketType::Data, ipv4_min());
             server.handle_datagram(&datagram, remote());
         }
         // Path 1's return association is (1001, 1); path 2 is separate.
+        // The first return packet gets sequence 1 (session-wide).
         let seq_p1 = Packet::decode(&server.process_return_packet(&ipv4_min()).unwrap().1)
             .unwrap()
             .header
             .sequence;
         assert_eq!(seq_p1, 1);
+        // A second return packet (same session) gets sequence 2, proving
+        // the counter is shared, not per-path.
+        let seq_p1b = Packet::decode(&server.process_return_packet(&ipv4_min()).unwrap().1)
+            .unwrap()
+            .header
+            .sequence;
+        assert_eq!(seq_p1b, 2);
     }
 
     #[test]
@@ -1541,14 +1895,14 @@ mod tests {
             remote_addr: "127.0.0.1:9".parse().unwrap(),
             session_id,
             path_id,
-            initial_sequence: 500,
         })
         .await
         .expect("udp bind works in test");
-        let upload_packet = path.next_packet(PacketType::Data, probe.clone());
+        // Day 15: sequence 1 for in-order delivery through the reorder buffer.
+        let upload_packet = path.next_packet(PacketType::Data, probe.clone(), 1);
         assert_eq!(upload_packet.header.session_id, session_id);
         assert_eq!(upload_packet.header.path_id, path_id);
-        assert_eq!(upload_packet.header.sequence, 500);
+        assert_eq!(upload_packet.header.sequence, 1);
         let upload_bytes = upload_packet.encode().expect("encode");
 
         // Stage 2 (server, real): decode, registry observation, IP
@@ -1631,12 +1985,11 @@ mod tests {
             remote_addr: "127.0.0.1:9".parse().unwrap(),
             session_id,
             path_id,
-            initial_sequence: 1,
         })
         .await
         .expect("udp bind");
         let upload_bytes = path
-            .next_packet(PacketType::Data, probe.clone())
+            .next_packet(PacketType::Data, probe.clone(), 1)
             .encode()
             .expect("encode");
 
@@ -1763,5 +2116,103 @@ mod tests {
         let sessions = server.sessions();
         assert_eq!(sessions[0].paths.len(), 1);
         assert!(sessions[0].paths.iter().all(|p| p.path_id == 1));
+    }
+
+    // Day 15: ordering tests.
+
+    #[test]
+    fn out_of_order_upload_is_reordered_by_logical_sequence() {
+        // Packets arrive on different path IDs out of order; the TUN
+        // queue must receive them in logical sequence order.
+        let (server, mut rx) = server_with_queue(16);
+        let addr: std::net::SocketAddr = "127.0.0.1:44001".parse().unwrap();
+        // Seq 1 on path 1, seq 3 on path 2, seq 2 on path 1.
+        for (seq, path_id) in [(1u64, 1u16), (3, 2), (2, 1)] {
+            let payload = ipv4_with_seq(seq as u8);
+            let d = encode_packet(1001, path_id, seq, PacketType::Data, payload);
+            server.handle_datagram(&d, addr);
+        }
+        // Must receive in order 1, 2, 3 regardless of arrival order/path.
+        for expected_seq in [1u8, 2, 3] {
+            let queued = rx.try_recv().expect("ordered packet must be queued");
+            assert_eq!(queued[1], expected_seq, "payload marker must be in order");
+        }
+    }
+
+    #[test]
+    fn duplicate_upload_packet_emitted_once() {
+        let (server, mut rx) = server_with_queue(16);
+        let addr: std::net::SocketAddr = "127.0.0.1:44002".parse().unwrap();
+        // Seq 1 delivered, seq 3 buffered (gap at 2), then seq 3 again
+        // (true duplicate — already buffered).
+        let d1 = encode_packet(1001, 1, 1, PacketType::Data, ipv4_min());
+        server.handle_datagram(&d1, addr);
+        let d3 = encode_packet(1001, 2, 3, PacketType::Data, ipv4_min());
+        server.handle_datagram(&d3, addr);
+        server.handle_datagram(&d3, addr); // duplicate
+        // Seq 1 was delivered.
+        assert!(rx.try_recv().is_ok());
+        // Seq 3 is still buffered (waiting for 2), not delivered twice.
+        assert!(rx.try_recv().is_err());
+        assert_eq!(server.stats().upload_duplicates_dropped, 1);
+        // Now seq 2 arrives, releasing 2 and 3 (3 emitted once).
+        let d2 = encode_packet(1001, 1, 2, PacketType::Data, ipv4_min());
+        server.handle_datagram(&d2, addr);
+        assert!(rx.try_recv().is_ok()); // seq 2
+        assert!(rx.try_recv().is_ok()); // seq 3 (once)
+        assert!(rx.try_recv().is_err()); // no duplicate
+    }
+
+    #[test]
+    fn invalid_packets_do_not_mutate_reorder_state() {
+        let (server, mut rx) = server_with_queue(16);
+        let addr: std::net::SocketAddr = "127.0.0.1:44003".parse().unwrap();
+        // Valid seq 1.
+        let d1 = encode_packet(1001, 1, 1, PacketType::Data, ipv4_min());
+        server.handle_datagram(&d1, addr);
+        assert!(rx.try_recv().is_ok());
+        // Invalid: wrong session (rejected before reorder buffer).
+        let bad = encode_packet(9999, 1, 2, PacketType::Data, ipv4_min());
+        server.handle_datagram(&bad, addr);
+        // Invalid: PathHello (control packet, never enters IP reorder).
+        let hello = encode_packet(1001, 1, 2, PacketType::PathHello, vec![]);
+        server.handle_datagram(&hello, addr);
+        // Valid seq 2 must still be delivered (buffer not corrupted).
+        let d2 = encode_packet(1001, 1, 2, PacketType::Data, ipv4_min());
+        server.handle_datagram(&d2, addr);
+        assert!(rx.try_recv().is_ok(), "seq 2 must be delivered");
+    }
+
+    #[test]
+    fn upload_and_return_sequences_are_independent() {
+        // Upload uses the client's session-wide counter; return uses the
+        // server's session-wide counter. They are independent spaces.
+        let server = server_with_endpoint(1001, 1);
+        // Upload seq 1, 2, 3 (client side, simulated).
+        let addr: std::net::SocketAddr = "127.0.0.1:44004".parse().unwrap();
+        for seq in [1u64, 2, 3] {
+            let d = encode_packet(1001, 1, seq, PacketType::Data, ipv4_min());
+            server.handle_datagram(&d, addr);
+        }
+        // Return seq 1, 2 (server side).
+        let r1 = Packet::decode(&server.process_return_packet(&ipv4_min()).unwrap().1)
+            .unwrap()
+            .header
+            .sequence;
+        let r2 = Packet::decode(&server.process_return_packet(&ipv4_min()).unwrap().1)
+            .unwrap()
+            .header
+            .sequence;
+        // Return starts at 1, independent of upload's 1,2,3.
+        assert_eq!((r1, r2), (1, 2));
+    }
+
+    /// Helper: minimal IPv4 packet with a marker byte for ordering tests.
+    fn ipv4_with_seq(marker: u8) -> Vec<u8> {
+        let mut p = vec![0u8; 20];
+        p[0] = 0x45;
+        p[1] = marker;
+        p[2..4].copy_from_slice(&20u16.to_be_bytes());
+        p
     }
 }

@@ -21,4 +21,7 @@ pub enum CryptoError {
     /// No plaintext is returned in this case.
     #[error("authentication failed")]
     AuthenticationFailed,
+    /// HKDF key derivation failed.
+    #[error("key derivation failed")]
+    KeyDerivationFailed,
 }

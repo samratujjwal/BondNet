@@ -42,6 +42,9 @@ mod path_diag;
 mod smoke;
 mod tunnel_smoke;
 
+use bondnet_client::bench;
+use bondnet_client::health_diag;
+
 use bondnet_client::{UdpPath, parse_args};
 use bondnet_protocol::PacketType;
 
@@ -54,6 +57,10 @@ async fn main() {
         tunnel_smoke::run(&args[2..]).await
     } else if args.get(1).is_some_and(|first| first == "path-diag") {
         path_diag::run(&args[2..]).await
+    } else if args.get(1).is_some_and(|first| first == "bench") {
+        bench::run_bench(&args[2..]).await
+    } else if args.get(1).is_some_and(|first| first == "health-diag") {
+        health_diag::run(&args[2..]).await
     } else {
         run_path_client(&args).await
     };
@@ -112,7 +119,9 @@ async fn run_path_client(args: &[String]) -> Result<(), Box<dyn std::error::Erro
             PacketType::Data => format!("bondnet-day7-ping-{i}").into_bytes(),
             _ => Vec::new(),
         };
-        let sequence = path.send_new(packet_type, payload).await?;
+        // Day 15: explicit session-wide sequence (i+1). This is the legacy
+        // single-path burst mode; the sequence is the logical order.
+        let sequence = path.send_new(packet_type, payload, i + 1).await?;
         println!("seq={sequence} type={packet_type:?}");
         if verbose {
             let stats = path.stats();

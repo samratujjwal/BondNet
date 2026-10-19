@@ -16,11 +16,32 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use bondnet_protocol::{PROTOCOL_VERSION, Packet, PacketHeader, PacketType};
+use bondnet_protocol::{HEADER_LEN, MAGIC, PROTOCOL_VERSION, Packet, PacketHeader, PacketType};
 use tokio::net::UdpSocket;
 
 use crate::config::UdpPathConfig;
 use crate::error::TransportError;
+
+/// Construct the 36-byte header encoding for use as AAD.
+///
+/// This replicates the header serialization from `Packet::encode`,
+/// with the given `payload_len` (used for the ciphertext length when
+/// encrypting).
+fn header_aad(header: &PacketHeader, payload_len: usize) -> [u8; HEADER_LEN] {
+    let mut out = [0u8; HEADER_LEN];
+    out[0..2].copy_from_slice(&MAGIC);
+    out[2] = header.version;
+    out[3] = header.flags;
+    out[4..6].copy_from_slice(&(HEADER_LEN as u16).to_be_bytes());
+    out[6..14].copy_from_slice(&header.session_id.to_be_bytes());
+    out[14..22].copy_from_slice(&header.sequence.to_be_bytes());
+    out[22..24].copy_from_slice(&header.path_id.to_be_bytes());
+    out[24] = header.packet_type.as_u8();
+    out[25] = 0; // reserved
+    out[26..34].copy_from_slice(&header.timestamp.to_be_bytes());
+    out[34..36].copy_from_slice(&(payload_len as u16).to_be_bytes());
+    out
+}
 
 /// Plain-data copy of per-path counters, for tests and future inspection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -47,8 +68,10 @@ struct PathStats {
 pub struct UdpPath {
     socket: UdpSocket,
     config: UdpPathConfig,
-    next_sequence: AtomicU64,
     stats: PathStats,
+    /// Day 18: optional secure session. When set, DATA payloads are
+    /// encrypted with authenticated encryption before sending.
+    secure_session: std::sync::Mutex<Option<std::sync::Arc<bondnet_crypto::SecureSession>>>,
 }
 
 impl UdpPath {
@@ -69,11 +92,17 @@ impl UdpPath {
             .await
             .map_err(TransportError::ConnectFailed)?;
         Ok(Self {
-            next_sequence: AtomicU64::new(config.initial_sequence),
             socket,
             config,
             stats: PathStats::default(),
+            secure_session: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Day 18: attach a secure session for authenticated encryption.
+    /// When attached, DATA packet payloads are encrypted before sending.
+    pub fn set_secure_session(&self, session: std::sync::Arc<bondnet_crypto::SecureSession>) {
+        *self.secure_session.lock().expect("secure lock poisoned") = Some(session);
     }
 
     /// The actual bound local address (ephemeral port resolved).
@@ -118,23 +147,57 @@ impl UdpPath {
         }
     }
 
-    /// Build the next outbound packet: stamps the configured session and
-    /// path IDs, the next monotonic tunnel sequence number, and the
-    /// current Unix time in milliseconds. No wrap-around handling yet.
-    pub fn next_packet(&self, packet_type: PacketType, payload: Vec<u8>) -> Packet {
-        let sequence = self.next_sequence.fetch_add(1, Ordering::SeqCst);
-        Packet {
-            header: PacketHeader {
-                version: PROTOCOL_VERSION,
-                flags: 0,
-                session_id: self.config.session_id,
-                sequence,
-                path_id: self.config.path_id,
-                packet_type,
-                timestamp: unix_millis(),
-            },
-            payload,
-        }
+    /// Build an outbound packet: stamps the configured session and path
+    /// IDs, the caller-supplied logical sequence number, and the current
+    /// Unix time in milliseconds.
+    ///
+    /// Day 15: the sequence is the session-wide logical order (allocated
+    /// by the data plane before path selection), NOT a per-path counter.
+    /// The path only carries the sequence; it never allocates it.
+    pub fn next_packet(&self, packet_type: PacketType, payload: Vec<u8>, sequence: u64) -> Packet {
+        // Day 18: if a secure session is set and this is a DATA packet,
+        // encrypt the payload with the header as AAD.
+        let secure = if packet_type == PacketType::Data {
+            self.secure_session
+                .lock()
+                .expect("secure lock poisoned")
+                .clone()
+        } else {
+            None
+        };
+
+        let header = PacketHeader {
+            version: PROTOCOL_VERSION,
+            flags: 0,
+            session_id: self.config.session_id,
+            sequence,
+            path_id: self.config.path_id,
+            packet_type,
+            timestamp: unix_millis(),
+        };
+
+        let payload = if let Some(session) = secure {
+            // Ciphertext is plaintext + 16-byte tag.
+            let ciphertext_len = payload.len() + bondnet_crypto::TAG_SIZE;
+            // Build AAD from the header with the ciphertext length.
+            let aad = header_aad(&header, ciphertext_len);
+            // Day 19: use KeyDomain::UploadData with sequence as the nonce
+            // counter. The sequence is unique per (session, direction),
+            // so the nonce is unique. The server reconstructs the nonce
+            // from the header's sequence field.
+            session
+                .encrypt_with_counter(
+                    bondnet_crypto::KeyDomain::UploadData,
+                    sequence,
+                    &aad,
+                    &payload,
+                )
+                .expect("encryption is infallible with valid key/nonce")
+        } else {
+            payload
+        };
+
+        Packet { header, payload }
     }
 
     /// Encode `packet` and send it to the VPS. Updates send telemetry.
@@ -158,14 +221,15 @@ impl UdpPath {
         Ok(sent)
     }
 
-    /// Build the next packet and send it. Returns the sequence number used.
+    /// Build a packet with the given logical sequence and send it.
+    /// Returns the sequence number used.
     pub async fn send_new(
         &self,
         packet_type: PacketType,
         payload: Vec<u8>,
+        sequence: u64,
     ) -> Result<u64, TransportError> {
-        let packet = self.next_packet(packet_type, payload);
-        let sequence = packet.header.sequence;
+        let packet = self.next_packet(packet_type, payload, sequence);
         self.send_packet(&packet).await?;
         Ok(sequence)
     }

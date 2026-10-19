@@ -82,6 +82,7 @@ fn parse_path_args(
         path_id: path_id.ok_or_else(|| format!("{} is required", flag("id")))?,
         local_addr: local.ok_or_else(|| format!("{} is required", flag("local")))?,
         remote_addr: remote.ok_or_else(|| format!("{} is required", flag("remote")))?,
+        bandwidth_bps: bondnet_client::config::DEFAULT_BANDWIDTH_BPS,
         enabled,
     })
 }
@@ -155,7 +156,9 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 
     // Harmless diagnostic: one PathHello per initialized path. The server
     // records these via its normal observation path (Day 6); check its
-    // verbose log for the matching lines.
+    // verbose log for the matching lines. PathHello is a control packet —
+    // it carries a diagnostic sequence (not part of the ordered stream).
+    let mut diag_seq = 1u64;
     for status in manager.status() {
         if !status.initialized {
             continue;
@@ -163,11 +166,17 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let path = manager
             .get(status.path_id)
             .expect("initialized path is present");
-        match path.send_new(PacketType::PathHello, Vec::new()).await {
-            Ok(sequence) => println!(
-                "path \"{}\" id={}: PathHello sent seq={sequence}",
-                status.name, status.path_id,
-            ),
+        match path
+            .send_new(PacketType::PathHello, Vec::new(), diag_seq)
+            .await
+        {
+            Ok(sequence) => {
+                diag_seq += 1;
+                println!(
+                    "path \"{}\" id={}: PathHello sent seq={sequence}",
+                    status.name, status.path_id,
+                )
+            }
             Err(error) => {
                 if parsed.verbose {
                     eprintln!(

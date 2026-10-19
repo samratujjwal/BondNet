@@ -8,6 +8,10 @@
 
 use std::net::SocketAddr;
 
+/// Default static bandwidth weight (1 Mbps) when the operator does not
+/// specify one. Equal weights across paths yield smooth round-robin.
+pub const DEFAULT_BANDWIDTH_BPS: u64 = 1_000_000;
+
 /// Configuration for one physical UDP path.
 #[derive(Debug, Clone)]
 pub struct UdpPathConfig {
@@ -24,9 +28,6 @@ pub struct UdpPathConfig {
     /// VPS endpoint, e.g. `203.0.113.10:51820` (documentation IP — the
     /// real one comes from the operator).
     pub remote_addr: SocketAddr,
-    /// First outbound BondNet tunnel sequence number. Explicit so tests
-    /// are deterministic.
-    pub initial_sequence: u64,
 }
 
 /// Day 13: configuration for one physical path, without session identity.
@@ -49,21 +50,24 @@ pub struct PhysicalPathConfig {
     /// VPS endpoint, e.g. `203.0.113.10:51820`. Port 0 is rejected for
     /// an enabled path (there is nothing to talk to).
     pub remote_addr: SocketAddr,
+    /// Static bandwidth weight for the Day 14 scheduler, bytes per second.
+    /// Used as the `bandwidth_bps` in the scheduler's `PathStats`; all
+    /// other stats are zero ("unknown") until active probing exists.
+    /// Equal values mean equal weights (smooth round-robin).
+    pub bandwidth_bps: u64,
     /// Disabled paths are validated but never bound.
     pub enabled: bool,
 }
 
 impl PhysicalPathConfig {
     /// Attach the session identity to produce the `UdpPathConfig` that
-    /// `UdpPath::bind` expects. The caller chooses the initial sequence
-    /// (1 for production, explicit values for deterministic tests).
-    pub fn to_udp_path_config(&self, session_id: u64, initial_sequence: u64) -> UdpPathConfig {
+    /// `UdpPath::bind` expects.
+    pub fn to_udp_path_config(&self, session_id: u64) -> UdpPathConfig {
         UdpPathConfig {
             path_id: self.path_id,
             session_id,
             local_addr: self.local_addr,
             remote_addr: self.remote_addr,
-            initial_sequence,
         }
     }
 }
@@ -190,7 +194,6 @@ pub fn parse_args(args: &[String]) -> Result<(UdpPathConfig, u64, bool), String>
         session_id: session_id.ok_or_else(|| "--session-id is required".to_string())?,
         local_addr,
         remote_addr: remote.ok_or_else(|| "--remote is required".to_string())?,
-        initial_sequence: 1,
     };
     Ok((config, count, verbose))
 }
@@ -224,7 +227,6 @@ mod tests {
         assert_eq!(config.session_id, 1001);
         assert_eq!(config.local_addr.to_string(), "192.168.0.170:0");
         assert_eq!(config.remote_addr.to_string(), "203.0.113.10:51820");
-        assert_eq!(config.initial_sequence, 1);
         assert_eq!(count, 5);
         assert!(!verbose);
     }
@@ -273,6 +275,7 @@ mod tests {
             path_id: id,
             local_addr: local.parse().unwrap(),
             remote_addr: remote.parse().unwrap(),
+            bandwidth_bps: DEFAULT_BANDWIDTH_BPS,
             enabled,
         }
     }
@@ -331,10 +334,9 @@ mod tests {
     #[test]
     fn to_udp_path_config_attaches_session() {
         let p = path("primary", 1, "127.0.0.1:0", "127.0.0.1:51820", true);
-        let udp = p.to_udp_path_config(1001, 42);
+        let udp = p.to_udp_path_config(1001);
         assert_eq!(udp.path_id, 1);
         assert_eq!(udp.session_id, 1001);
-        assert_eq!(udp.initial_sequence, 42);
         assert_eq!(udp.local_addr.to_string(), "127.0.0.1:0");
     }
 }

@@ -145,6 +145,10 @@ pub struct DataPlane {
     path: Arc<UdpPath>,
     metrics: Arc<DataPlaneMetrics>,
     max_wintun_len: usize,
+    /// Day 15: session-wide logical sequence counter. Allocated before
+    /// sending, independent of the path. For a single-path plane this
+    /// behaves identically to the old per-path counter.
+    upload_sequence: AtomicU64,
 }
 
 impl DataPlane {
@@ -161,6 +165,7 @@ impl DataPlane {
             path,
             metrics: Arc::new(DataPlaneMetrics::default()),
             max_wintun_len,
+            upload_sequence: AtomicU64::new(1),
         }
     }
 
@@ -193,10 +198,10 @@ impl DataPlane {
     /// through the physical path.
     ///
     /// The payload is the exact `packet` bytes — no envelope, no IP/TCP
-    /// metadata, no interface identifiers are added. Session ID, path ID
-    /// and the tunnel sequence number come from the `UdpPath`
-    /// configuration. Returns the BondNet tunnel sequence number stamped
-    /// on the packet.
+    /// metadata, no interface identifiers are added. Session ID and path
+    /// ID come from the `UdpPath` configuration; the sequence is the
+    /// session-wide logical order allocated here (Day 15). Returns the
+    /// BondNet tunnel sequence number stamped on the packet.
     pub async fn send_wintun_packet(&self, packet: &[u8]) -> Result<u64, DataPlaneError> {
         if packet.is_empty() {
             self.metrics.invalid_dropped.fetch_add(1, Ordering::Relaxed);
@@ -211,7 +216,12 @@ impl DataPlane {
                 max: self.max_wintun_len,
             });
         }
-        match self.path.send_new(PacketType::Data, packet.to_vec()).await {
+        let sequence = self.upload_sequence.fetch_add(1, Ordering::SeqCst);
+        match self
+            .path
+            .send_new(PacketType::Data, packet.to_vec(), sequence)
+            .await
+        {
             Ok(sequence) => {
                 self.metrics
                     .tunnel_packets_sent

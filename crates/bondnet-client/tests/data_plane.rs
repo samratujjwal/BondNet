@@ -14,9 +14,9 @@ use bondnet_protocol::{Packet, PacketType};
 const RECV_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A data plane sending to `rx`, plus the receiving socket itself.
-/// Session 1001, path 1, sequence starting at `initial_sequence` — the
-/// Day 9 development values from the brief.
-async fn plane_and_receiver(initial_sequence: u64) -> (DataPlane, tokio::net::UdpSocket) {
+/// Session 1001, path 1 — the Day 9 development values from the brief.
+/// Day 15: the sequence is session-wide, always starting at 1.
+async fn plane_and_receiver() -> (DataPlane, tokio::net::UdpSocket) {
     let rx = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
     let rx_addr = rx.local_addr().unwrap();
     let config = UdpPathConfig {
@@ -24,7 +24,6 @@ async fn plane_and_receiver(initial_sequence: u64) -> (DataPlane, tokio::net::Ud
         session_id: 1001,
         local_addr: "127.0.0.1:0".parse().unwrap(),
         remote_addr: rx_addr,
-        initial_sequence,
     };
     let path = std::sync::Arc::new(UdpPath::bind(config).await.unwrap());
     (DataPlane::new(path), rx)
@@ -44,7 +43,7 @@ async fn recv_packet(rx: &tokio::net::UdpSocket) -> Packet {
 /// configured session/path/sequence stamped on the envelope.
 #[tokio::test]
 async fn wintun_bytes_become_data_payload_unchanged() {
-    let (plane, rx) = plane_and_receiver(7).await;
+    let (plane, rx) = plane_and_receiver().await;
     // Looks like the start of a real IPv4 header; the data plane must
     // not care — it transports bytes, not IP semantics.
     let inner: Vec<u8> = (0..64u8)
@@ -52,14 +51,17 @@ async fn wintun_bytes_become_data_payload_unchanged() {
         .collect();
 
     let seq = plane.send_wintun_packet(&inner).await.unwrap();
-    assert_eq!(seq, 7);
+    assert_eq!(seq, 1, "Day 15: session-wide sequence starts at 1");
 
     let packet = recv_packet(&rx).await;
     assert_eq!(packet.header.packet_type, PacketType::Data);
     assert_eq!(packet.payload, inner, "payload must be byte-exact");
     assert_eq!(packet.header.session_id, 1001);
     assert_eq!(packet.header.path_id, 1);
-    assert_eq!(packet.header.sequence, 7);
+    assert_eq!(
+        packet.header.sequence, 1,
+        "Day 15: session-wide sequence starts at 1"
+    );
 }
 
 /// Test 2 — encode/decode round trip preserves the payload exactly.
@@ -67,7 +69,7 @@ async fn wintun_bytes_become_data_payload_unchanged() {
 async fn encode_decode_round_trip_preserves_payload() {
     let inner = synthetic::ipv4_udp_test_packet(&vec![0xABu8; 1472]);
     assert_eq!(inner.len(), 1500);
-    let (plane, rx) = plane_and_receiver(1).await;
+    let (plane, rx) = plane_and_receiver().await;
 
     plane.send_wintun_packet(&inner).await.unwrap();
     let packet = recv_packet(&rx).await;
@@ -79,7 +81,7 @@ async fn encode_decode_round_trip_preserves_payload() {
 /// Test 3 — payloads from 64 to 1500 bytes arrive byte-exact.
 #[tokio::test]
 async fn payload_sizes_preserved() {
-    let (plane, rx) = plane_and_receiver(100).await;
+    let (plane, rx) = plane_and_receiver().await;
     for (i, size) in [64usize, 512, 1200, 1400, 1500].iter().enumerate() {
         let payload = vec![(i + 1) as u8; size - 28];
         let inner = synthetic::ipv4_udp_test_packet(&payload);
@@ -87,8 +89,9 @@ async fn payload_sizes_preserved() {
 
         let seq = plane.send_wintun_packet(&inner).await.unwrap();
         let packet = recv_packet(&rx).await;
-        assert_eq!(packet.header.sequence, 100 + i as u64);
-        assert_eq!(seq, 100 + i as u64);
+        // Day 15: session-wide sequences start at 1.
+        assert_eq!(packet.header.sequence, 1 + i as u64);
+        assert_eq!(seq, 1 + i as u64);
         assert_eq!(packet.payload, inner, "size {size} must be byte-exact");
     }
 }
@@ -96,7 +99,7 @@ async fn payload_sizes_preserved() {
 /// Test 4 — three packets get consecutive tunnel sequence numbers.
 #[tokio::test]
 async fn sequence_increases_monotonically() {
-    let (plane, rx) = plane_and_receiver(41).await;
+    let (plane, rx) = plane_and_receiver().await;
     let mut seqs = Vec::new();
     for _ in 0..3 {
         let inner = synthetic::ipv4_udp_test_packet(b"seq-test");
@@ -104,13 +107,14 @@ async fn sequence_increases_monotonically() {
         let packet = recv_packet(&rx).await;
         assert_eq!(packet.header.sequence, *seqs.last().unwrap());
     }
-    assert_eq!(seqs, [41, 42, 43]);
+    // Day 15: session-wide sequences start at 1 and increment by 1.
+    assert_eq!(seqs, [1, 2, 3]);
 }
 
 /// Test 5 — every outgoing packet carries path_id = 1, session_id = 1001.
 #[tokio::test]
 async fn path_and_session_metadata_preserved() {
-    let (plane, rx) = plane_and_receiver(1).await;
+    let (plane, rx) = plane_and_receiver().await;
     for _ in 0..3 {
         let inner = synthetic::ipv4_udp_test_packet(b"meta");
         plane.send_wintun_packet(&inner).await.unwrap();
@@ -124,7 +128,7 @@ async fn path_and_session_metadata_preserved() {
 /// Test 6 — a 1501-byte inner packet is rejected, counted, and never sent.
 #[tokio::test]
 async fn oversized_packet_rejected_and_counted() {
-    let (plane, _rx) = plane_and_receiver(1).await;
+    let (plane, _rx) = plane_and_receiver().await;
     let big = vec![0u8; MAX_WINTUN_PACKET_LEN + 1];
 
     let error = plane.send_wintun_packet(&big).await.unwrap_err();
@@ -151,7 +155,6 @@ async fn custom_budget_rejects_sooner() {
         session_id: 1001,
         local_addr: "127.0.0.1:0".parse().unwrap(),
         remote_addr: rx_addr,
-        initial_sequence: 1,
     };
     let plane = DataPlane::with_max_wintun_len(
         std::sync::Arc::new(UdpPath::bind(config).await.unwrap()),
@@ -171,7 +174,7 @@ async fn custom_budget_rejects_sooner() {
 /// Test 7 — an empty "packet" is rejected, counted, and never sent.
 #[tokio::test]
 async fn empty_packet_rejected() {
-    let (plane, _rx) = plane_and_receiver(1).await;
+    let (plane, _rx) = plane_and_receiver().await;
     assert!(matches!(
         plane.send_wintun_packet(&[]).await,
         Err(DataPlaneError::EmptyPacket)
@@ -195,7 +198,7 @@ async fn synthetic_fixture_is_valid_ipv4() {
 /// Test 9 — a full send updates the tunnel counters exactly.
 #[tokio::test]
 async fn metrics_count_sends() {
-    let (plane, rx) = plane_and_receiver(1).await;
+    let (plane, rx) = plane_and_receiver().await;
     let payload = vec![9u8; 100];
     let inner = synthetic::ipv4_udp_test_packet(&payload);
     plane.send_wintun_packet(&inner).await.unwrap();

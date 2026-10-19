@@ -10,6 +10,7 @@
 //! dependency-free data structure that turns out-of-order tunnel sequences
 //! into an in-order stream. No networking, no timers, no retransmission.
 
+pub mod ordered;
 pub mod reorder;
 
 pub use reorder::{GapInfo, PushResult, ReorderBuffer};

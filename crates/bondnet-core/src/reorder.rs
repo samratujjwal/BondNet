@@ -211,4 +211,29 @@ impl<T> ReorderBuffer<T> {
             released.push(packet);
         }
     }
+
+    /// Skip the current gap: advance `next_expected` to the first buffered
+    /// sequence, abandoning the missing sequences in between.
+    ///
+    /// Day 15: this is the timeout policy. A missing packet that never
+    /// arrives would block delivery forever; the caller decides when a gap
+    /// has been stale too long and calls this to unstick the buffer.
+    ///
+    /// Returns `(skipped_count, released_packets)`: how many sequences
+    /// were abandoned, and the now-contiguous packets in order. Returns
+    /// `None` if there is no gap (buffer empty or already contiguous).
+    ///
+    /// The skipped sequences are NOT delivered — this is loss, not
+    /// recovery. The caller must count them as gaps.
+    pub fn skip_gap(&mut self) -> Option<(u64, Vec<T>)> {
+        let gap = self.gap()?;
+        let skipped = gap.first_buffered - self.next_expected;
+        // Remove the first buffered packet and start the released vec
+        // with it, then advance over any contiguous followers.
+        let first = self.buffered.remove(&gap.first_buffered)?;
+        self.next_expected = gap.first_buffered;
+        let mut released = vec![first];
+        self.advance_frontier(&mut released);
+        Some((skipped, released))
+    }
 }

@@ -41,6 +41,11 @@ pub struct ServerConfig {
     /// Day 11: a `(session, path)` endpoint association older than this
     /// is treated as expired and return packets are dropped. Seconds.
     pub tun_return_max_age_secs: u64,
+    /// Day 18: pre-shared key (32 bytes) for authenticated encryption.
+    /// `None` disables encryption (plaintext mode, with warning).
+    /// When set, DATA packets must be encrypted; unauthenticated packets
+    /// are dropped before they can affect session state.
+    pub psk: Option<bondnet_crypto::CryptoKey>,
 }
 
 /// Default staleness bound for the return-path endpoint association.
@@ -61,6 +66,7 @@ impl Default for ServerConfig {
             tun_return_session: None,
             tun_return_path: None,
             tun_return_max_age_secs: DEFAULT_RETURN_MAX_AGE_SECS,
+            psk: None,
         }
     }
 }
@@ -116,6 +122,32 @@ impl ServerConfig {
         }
         Ok(Some((session, path)))
     }
+}
+
+/// Parse a 64-character hex PSK into a CryptoKey.
+///
+/// The hex string must decode to exactly 32 bytes. This is the only
+/// place where key material enters from the CLI; the bytes are never
+/// logged.
+fn parse_psk(hex: &str) -> Result<bondnet_crypto::CryptoKey, String> {
+    if hex.len() != 64 {
+        return Err(format!(
+            "invalid --psk: expected 64 hex chars (32 bytes), got {}",
+            hex.len()
+        ));
+    }
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid --psk: not hex at position {}", i * 2))?;
+        let lo = (chunk[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid --psk: not hex at position {}", i * 2 + 1))?;
+        bytes[i] = ((hi << 4) | lo) as u8;
+    }
+    bondnet_crypto::CryptoKey::from_slice(&bytes)
+        .map_err(|_| "invalid --psk: must be 32 bytes".to_string())
 }
 
 /// Parse the CLI.
@@ -201,6 +233,12 @@ pub fn parse_args(args: &[String]) -> Result<ServerConfig, String> {
                 config.tun_return_max_age_secs = value
                     .parse()
                     .map_err(|_| format!("invalid --tun-return-max-age-secs: {value}"))?;
+            }
+            "--psk" => {
+                let value = rest.next().ok_or_else(|| {
+                    "--psk requires a 64-char hex string (32 bytes), e.g. --psk 0011...".to_string()
+                })?;
+                config.psk = Some(parse_psk(value)?);
             }
             other => return Err(format!("unknown argument: {other}")),
         }

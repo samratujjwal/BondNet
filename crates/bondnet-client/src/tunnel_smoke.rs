@@ -30,6 +30,7 @@ use bondnet_client::data_plane::DataPlane;
 #[cfg(windows)]
 use bondnet_client::return_path::RETURN_CHANNEL_CAPACITY;
 use bondnet_client::return_path::ReturnProcessor;
+use bondnet_client::return_path::{RETURN_REORDER_BUFFER_SIZE, RETURN_REORDER_TIMEOUT};
 use bondnet_client::synthetic;
 use bondnet_client::{UdpPath, UdpPathConfig};
 
@@ -142,7 +143,6 @@ fn parse_tunnel_args(args: &[String]) -> Result<TunnelArgs, String> {
             session_id: session_id.ok_or_else(|| "--session-id is required".to_string())?,
             local_addr,
             remote_addr: remote.ok_or_else(|| "--remote is required".to_string())?,
-            initial_sequence: 1,
         },
         adapter_name,
         synthetic,
@@ -255,26 +255,48 @@ async fn return_receiver_loop(
     shutdown: Arc<AtomicBool>,
     verbose: bool,
 ) {
+    use bondnet_core::ordered::OrderedReceiver;
     let metrics = Arc::clone(processor.metrics());
+    // Day 15: ordered delivery for the return direction. The server
+    // stamps a session-wide return sequence; we buffer out-of-order
+    // packets and release them contiguously before Wintun delivery.
+    let mut order = OrderedReceiver::new(1, RETURN_REORDER_BUFFER_SIZE, RETURN_REORDER_TIMEOUT);
     let mut received = 0u64;
     loop {
         if shutdown.load(Ordering::SeqCst) {
             break;
         }
+        // Check for stale gaps on each loop iteration (timeout policy).
+        for payload in order.check_timeout() {
+            if let Some(tx) = &inbound_tx {
+                match tx.try_send(payload) {
+                    Ok(()) => {}
+                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                        metrics.backpressure_dropped.fetch_add(1, Ordering::Relaxed);
+                    }
+                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
+                }
+            }
+        }
         match tokio::time::timeout(std::time::Duration::from_secs(1), path.recv_packet()).await {
             Ok(Ok(packet)) => match processor.validate(&packet) {
                 Ok(payload) => {
                     received += 1;
+                    let sequence = packet.header.sequence;
                     if verbose && received % 50 == 1 {
-                        println!("return received inner={}B", payload.len());
+                        println!("return received inner={}B seq={sequence}", payload.len());
                     }
-                    if let Some(tx) = &inbound_tx {
-                        match tx.try_send(payload.to_vec()) {
-                            Ok(()) => {}
-                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                metrics.backpressure_dropped.fetch_add(1, Ordering::Relaxed);
+                    // Day 15: ordered delivery. Only contiguous packets
+                    // reach the Wintun writer.
+                    for ordered_payload in order.push(sequence, payload.to_vec()) {
+                        if let Some(tx) = &inbound_tx {
+                            match tx.try_send(ordered_payload) {
+                                Ok(()) => {}
+                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                    metrics.backpressure_dropped.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                             }
-                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                         }
                     }
                 }

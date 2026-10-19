@@ -773,3 +773,137 @@ MTU discovery, no production authentication.
 
 > Day 13 proves two paths can be configured, bound, observed, and shut
 > down independently. Using both for traffic is Day 14.
+
+## Day 14 — Multipath scheduler integration
+
+Day 14 wires the Day 4 smooth weighted round-robin scheduler into the
+client upload path via a new `MultipathDataPlane`.
+
+### Flow
+
+```text
+Wintun packet → validate → sync scheduler → select_path()
+→ encode DATA with selected path_id → send via that path's UdpPath
+→ per-path metrics
+```
+
+### Scheduler reuse
+
+The Day 4 `Scheduler`, `DefaultScorer`, `PathState`, and `PathHealth`
+are used unchanged. Each initialized path is registered with its
+configured `bandwidth_bps` (default 1 Mbps) and zeroed other stats
+("unknown" until active probing exists). Equal bandwidths yield smooth
+round-robin; 3:1 bandwidths yield a 3:1 distribution.
+
+`sync_scheduler` runs before every send: initialized paths are
+upserted only when their state changed (the scheduler resets the WRR
+cursor on update, so blind upserts would break distribution);
+removed/shut-down paths are deleted. No stale entries, no lock held
+across the socket send.
+
+### Eligibility
+
+A path is eligible when it is initialized (has a bound `UdpPath`) and
+its health is not `Unhealthy`. Health is operator-controlled
+(`set_path_health`); Day 14 does NOT auto-mark paths unhealthy on send
+errors — failures increment `send_errors` and the path stays eligible.
+No automatic failover is claimed.
+
+### Sequence numbers
+
+Each `UdpPath` keeps its independent counter. The `path_id` stamped on
+a packet always matches the socket it was sent through (debug-asserted).
+There is NO global ordering: packets on different paths may arrive out
+of order. The Day 5 reorder buffer is not integrated.
+
+### Return-path compatibility
+
+Unchanged: the server keys endpoints by `(session_id, path_id)` with
+per-path return sequences. Upload packets on different paths update
+their own associations; return traffic goes to the correct observed
+endpoint per path (Day 13 regression tests).
+
+### Explicit non-goals
+
+No reordering, no ACKs/retransmission, no replay protection, no
+encryption, no active probing, no production failure detection, no MTU
+discovery, no route/DNS changes.
+
+> Day 14 proves the scheduler distributes packets across healthy paths
+> deterministically in simulation. Real two-network distribution is not
+> proven here.
+
+## Day 15 — Packet ordering and delivery behavior
+
+Day 15 establishes session-wide logical sequence numbers and integrates
+bounded reorder buffers at both delivery boundaries.
+
+### Sequence model
+
+The 36-byte header is UNCHANGED. The `sequence` field (u64) is now the
+**session-wide logical order** per direction, not a per-path counter:
+
+- **Upload** (Windows → VPS): the client allocates from a session-wide
+  `AtomicU64` (in `DataPlane` or `MultipathDataPlane`) BEFORE path
+  selection. The `path_id` identifies which physical path carried the
+  packet; the `sequence` identifies its logical position in the session.
+- **Return** (VPS → Windows): the server allocates from a per-session
+  `u64` (in `SessionState`) when building the return datagram.
+
+The two directions have independent counters. Different sessions never
+share a counter. Allocation is via `fetch_add(SeqCst)` — thread-safe,
+no duplicates. The counter is u64 with no wrap-around (exhaustion is
+documented, not silently handled).
+
+`UdpPath` no longer owns a sequence counter; `next_packet` and
+`send_new` take an explicit sequence. Control packets (PathHello, etc.)
+carry a diagnostic sequence, not part of the ordered stream.
+
+### Reorder buffers
+
+Both directions use `OrderedReceiver` (bondnet-core), wrapping the Day 5
+`ReorderBuffer` with a timeout policy and metrics:
+
+- **Upload** (server): per-session `OrderedReceiver` in `forward_to_tun`.
+  Validated DATA packets enter the buffer keyed by logical sequence;
+  only contiguous packets are forwarded to the TUN queue, in order.
+- **Return** (client): single `OrderedReceiver` in `return_receiver_loop`.
+  Validated return DATA packets are buffered; contiguous packets go to
+  the Wintun writer channel in order.
+
+Control packets never enter the reorder buffer (filtered by
+`PacketType::Data` before buffering). Malformed packets are rejected
+before the buffer and cannot mutate its state.
+
+### Gap/timeout policy
+
+A missing packet blocks delivery of later packets (they stay buffered).
+If a gap persists longer than 200ms (`UPLOAD_REORDER_TIMEOUT` /
+`RETURN_REORDER_TIMEOUT`), the buffer skips it: the missing sequences
+are abandoned as LOSS (counted as gaps), and buffered packets are
+released. This prevents indefinite stalls but is NOT reliable delivery
+— TCP or the upper layer will see the loss.
+
+Buffer capacity is 256 packets per session (`*_REORDER_BUFFER_SIZE`).
+Overflow drops the newest packet and counts it. Memory is bounded.
+
+### Metrics
+
+Upload (server stats): `upload_ordered_delivered`, `upload_gaps`,
+`upload_gap_timeouts`, `upload_duplicates_dropped`,
+`upload_late_dropped`, `upload_overflow_dropped`.
+
+Return (client, in `OrderedReceiver`): packets received/delivered,
+gaps observed, timeouts, duplicates/late/overflow dropped, max depth.
+
+### What is proven
+
+Unit tests prove: in-order delivery, out-of-order reordering (1,3,2 →
+1,2,3), cross-path reordering by logical sequence, duplicate
+suppression, late-packet drops, invalid packets don't corrupt state,
+bounded overflow, timeout unblocks stuck buffers, independent
+upload/return spaces, concurrent allocation has no duplicates, payload
+bytes preserved, single-path compatibility.
+
+Real Windows↔VPS ordering over two physical networks is NOT proven by
+these tests.
