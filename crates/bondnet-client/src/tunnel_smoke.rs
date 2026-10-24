@@ -33,6 +33,7 @@ use bondnet_client::return_path::ReturnProcessor;
 use bondnet_client::return_path::{RETURN_REORDER_BUFFER_SIZE, RETURN_REORDER_TIMEOUT};
 use bondnet_client::synthetic;
 use bondnet_client::{UdpPath, UdpPathConfig};
+use bondnet_protocol::PacketType;
 
 // The Wintun data path (Mode B) only exists on Windows; the return-path
 // plumbing (Mode A + shared receiver) uses these on every platform.
@@ -56,6 +57,10 @@ struct TunnelArgs {
     verbose: bool,
     /// Day 11: enable the return path (UDP → validate → Wintun).
     ret: bool,
+    /// Day 20: pre-shared key for authenticated encryption. When set,
+    /// DATA is encrypted both directions and the session salt is sent
+    /// in the PathHello payload.
+    psk: Option<bondnet_crypto::CryptoKey>,
 }
 
 /// Parse the words after `tunnel-smoke`. Separate from the Day 7 parser
@@ -70,6 +75,7 @@ fn parse_tunnel_args(args: &[String]) -> Result<TunnelArgs, String> {
     let mut synthetic_count: u64 = 5;
     let mut verbose = false;
     let mut ret = false;
+    let mut psk: Option<bondnet_crypto::CryptoKey> = None;
 
     let mut rest = args.iter();
     while let Some(arg) = rest.next() {
@@ -127,6 +133,14 @@ fn parse_tunnel_args(args: &[String]) -> Result<TunnelArgs, String> {
             }
             "--verbose" => verbose = true,
             "--return" => ret = true,
+            "--psk" => {
+                let v = rest
+                    .next()
+                    .ok_or_else(|| "--psk requires a 64-char hex string".to_string())?;
+                psk = Some(
+                    bondnet_client::parse_psk_hex(v).map_err(|e| format!("tunnel-smoke: {e}"))?,
+                );
+            }
             other => return Err(format!("unknown tunnel-smoke argument: {other}")),
         }
     }
@@ -149,7 +163,35 @@ fn parse_tunnel_args(args: &[String]) -> Result<TunnelArgs, String> {
         synthetic_count,
         verbose,
         ret,
+        psk,
     })
+}
+
+/// Day 20: build the secure session from `--psk`, if given. The session
+/// carries a fresh random salt; callers send the salt in the PathHello
+/// payload so the server derives matching keys.
+fn build_secure_session(
+    parsed: &TunnelArgs,
+) -> Result<Option<Arc<bondnet_crypto::SecureSession>>, Box<dyn std::error::Error>> {
+    match &parsed.psk {
+        Some(key) => {
+            let session = Arc::new(
+                bondnet_crypto::SecureSession::new_with_random_salt(key, parsed.config.session_id)
+                    .map_err(|e| format!("failed to derive session keys: {e}"))?,
+            );
+            Ok(Some(session))
+        }
+        None => Ok(None),
+    }
+}
+
+/// Day 20: the PathHello payload. Empty in plaintext mode; the 32-byte
+/// session salt when encryption is on.
+fn path_hello_payload(secure: &Option<Arc<bondnet_crypto::SecureSession>>) -> Vec<u8> {
+    secure
+        .as_ref()
+        .map(|s| s.session_salt().to_vec())
+        .unwrap_or_default()
 }
 
 /// Run the smoke test. `args` are the CLI words after `tunnel-smoke`.
@@ -158,13 +200,17 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         format!(
             "{e}\nusage: bondnet-client tunnel-smoke --local ADDR:PORT --remote ADDR:PORT \
              --path-id N --session-id N [--adapter NAME] [--synthetic] [--synthetic-count N] \
-             [--return] [--verbose]"
+             [--return] [--psk HEX] [--verbose]"
         )
     })?;
 
-    println!(
-        "WARNING: BondNet Day 11 is plaintext (no encryption yet). Development use only — send harmless test payloads, never secrets."
-    );
+    if parsed.psk.is_some() {
+        println!("encryption: ENABLED (XChaCha20-Poly1305, session salt exchanged via PathHello)");
+    } else {
+        println!(
+            "WARNING: no --psk given, traffic is plaintext. Development use only — send harmless test payloads, never secrets."
+        );
+    }
 
     if parsed.synthetic {
         run_synthetic(parsed).await
@@ -180,7 +226,11 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
 /// (validating and counting them; there is no Wintun to write to in this
 /// mode) until Ctrl+C.
 async fn run_synthetic(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let secure = build_secure_session(&parsed)?;
     let path = Arc::new(UdpPath::bind(parsed.config).await?);
+    if let Some(s) = &secure {
+        path.set_secure_session(Arc::clone(s));
+    }
     println!(
         "tunnel-smoke (synthetic): local={} remote={} session={} path={}",
         path.local_addr()?,
@@ -188,6 +238,12 @@ async fn run_synthetic(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Err
         path.session_id(),
         path.path_id(),
     );
+    // Day 20: announce the session before any DATA so the server learns
+    // the session salt (carried in the PathHello payload when encrypted).
+    let hello_seq = path
+        .send_new(PacketType::PathHello, path_hello_payload(&secure), 0)
+        .await?;
+    println!("PathHello sent seq={hello_seq}");
     let plane = DataPlane::new(Arc::clone(&path));
 
     for i in 0..parsed.synthetic_count {
@@ -223,6 +279,9 @@ async fn run_synthetic(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Err
             plane_path(&plane),
             Arc::clone(&metrics),
         );
+        if let Some(s) = &secure {
+            processor.set_secure_session(Arc::clone(s));
+        }
         println!("Listening for return packets... (Ctrl+C to stop)");
         return_receiver_loop(path, processor, None, Arc::clone(&shutdown), parsed.verbose).await;
         let m = metrics.snapshot();
@@ -279,33 +338,53 @@ async fn return_receiver_loop(
             }
         }
         match tokio::time::timeout(std::time::Duration::from_secs(1), path.recv_packet()).await {
-            Ok(Ok(packet)) => match processor.validate(&packet) {
-                Ok(payload) => {
-                    received += 1;
-                    let sequence = packet.header.sequence;
-                    if verbose && received % 50 == 1 {
-                        println!("return received inner={}B seq={sequence}", payload.len());
+            // Day 20: always validate through the decrypting path. Without
+            // a secure session it behaves like `validate`; with one, the
+            // payload is authenticated and decrypted before IP checks. The
+            // AAD is the 36-byte wire header, reproduced by re-encoding
+            // the decoded packet (byte-identical: decode preserves every
+            // header field).
+            Ok(Ok(packet)) => {
+                let validated = match packet.encode() {
+                    Ok(datagram) => processor.validate_decrypted(&packet, &datagram),
+                    Err(_) => {
+                        metrics.invalid_protocol.fetch_add(1, Ordering::Relaxed);
+                        if verbose {
+                            eprintln!("return packet re-encode failed");
+                        }
+                        continue;
                     }
-                    // Day 15: ordered delivery. Only contiguous packets
-                    // reach the Wintun writer.
-                    for ordered_payload in order.push(sequence, payload.to_vec()) {
-                        if let Some(tx) = &inbound_tx {
-                            match tx.try_send(ordered_payload) {
-                                Ok(()) => {}
-                                Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                    metrics.backpressure_dropped.fetch_add(1, Ordering::Relaxed);
+                };
+                match validated {
+                    Ok(payload) => {
+                        received += 1;
+                        let sequence = packet.header.sequence;
+                        if verbose && received % 50 == 1 {
+                            println!("return received inner={}B seq={sequence}", payload.len());
+                        }
+                        // Day 15: ordered delivery. Only contiguous packets
+                        // reach the Wintun writer.
+                        for ordered_payload in order.push(sequence, payload) {
+                            if let Some(tx) = &inbound_tx {
+                                match tx.try_send(ordered_payload) {
+                                    Ok(()) => {}
+                                    Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                        metrics
+                                            .backpressure_dropped
+                                            .fetch_add(1, Ordering::Relaxed);
+                                    }
+                                    Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                                 }
-                                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => break,
                             }
                         }
                     }
-                }
-                Err(error) => {
-                    if verbose {
-                        eprintln!("return packet rejected: {error}");
+                    Err(error) => {
+                        if verbose {
+                            eprintln!("return packet rejected: {error}");
+                        }
                     }
                 }
-            },
+            }
             Ok(Err(error)) => {
                 // Decode failures are per-datagram, not fatal. Count them
                 // as protocol errors; the transport stays usable.
@@ -356,6 +435,9 @@ async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>
     let adapter = WintunAdapter::open_or_create(&lib, &parsed.adapter_name)?;
     println!("Adapter: {} (opened or created)", parsed.adapter_name);
 
+    // Day 20: encryption session from --psk, if given.
+    let secure = build_secure_session(&parsed)?;
+
     // The tunnel socket binds the PHYSICAL address — never Wintun. This
     // binding is the routing-recursion guard: tunnel UDP leaves through
     // the real interface, inner packets come from Wintun.
@@ -363,11 +445,20 @@ async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>
     // Day 11: the path is shared with the return receiver task, which
     // reads from the same socket the sender writes to.
     let path = Arc::new(UdpPath::bind(parsed.config).await?);
+    if let Some(s) = &secure {
+        path.set_secure_session(Arc::clone(s));
+    }
     let actual_local = path.local_addr()?;
     println!(
         "Tunnel UDP: {actual_local} -> {} (physical interface)",
         path.remote_addr()
     );
+    // Day 20: announce the session before any DATA so the server learns
+    // the session salt (carried in the PathHello payload when encrypted).
+    let hello_seq = path
+        .send_new(PacketType::PathHello, path_hello_payload(&secure), 0)
+        .await?;
+    println!("PathHello sent seq={hello_seq}");
     if actual_local.ip() != path.configured_local_addr().ip() {
         eprintln!(
             "WARNING: bound local IP {} differs from configured {}",
@@ -428,6 +519,10 @@ async fn run_wintun(parsed: TunnelArgs) -> Result<(), Box<dyn std::error::Error>
                 path.path_id(),
                 Arc::clone(metrics),
             );
+            // Day 20: decrypt return DATA when encryption is on.
+            if let Some(s) = &secure {
+                task_processor.set_secure_session(Arc::clone(s));
+            }
             let task_path = Arc::clone(&path);
             let task_shutdown = Arc::clone(&shutdown);
             Some(tokio::spawn(async move {

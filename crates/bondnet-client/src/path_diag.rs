@@ -19,7 +19,9 @@
 //! bound to another local IP is not proof of two independent Internet
 //! connections; see docs/day13-test-guide.md.
 
-use bondnet_client::{PathManager, PhysicalPathConfig};
+use std::sync::Arc;
+
+use bondnet_client::{PathManager, PhysicalPathConfig, parse_psk_hex};
 use bondnet_protocol::PacketType;
 
 struct DiagArgs {
@@ -27,6 +29,8 @@ struct DiagArgs {
     path1: PhysicalPathConfig,
     path2: PhysicalPathConfig,
     verbose: bool,
+    /// Day 20: pre-shared key for authenticated encryption.
+    psk: Option<bondnet_crypto::CryptoKey>,
 }
 
 fn parse_path_args(
@@ -90,6 +94,7 @@ fn parse_path_args(
 fn parse_diag_args(args: &[String]) -> Result<DiagArgs, String> {
     let mut session_id: Option<u64> = None;
     let mut verbose = false;
+    let mut psk: Option<bondnet_crypto::CryptoKey> = None;
     let mut rest_args: Vec<String> = Vec::new();
 
     let mut rest = args.iter();
@@ -105,6 +110,12 @@ fn parse_diag_args(args: &[String]) -> Result<DiagArgs, String> {
                 );
             }
             "--verbose" => verbose = true,
+            "--psk" => {
+                let v = rest
+                    .next()
+                    .ok_or_else(|| "--psk requires a 64-char hex string".to_string())?;
+                psk = Some(parse_psk_hex(v)?);
+            }
             _ => rest_args.push(arg.clone()),
         }
     }
@@ -114,6 +125,7 @@ fn parse_diag_args(args: &[String]) -> Result<DiagArgs, String> {
         path1: parse_path_args(&rest_args, "path1", "primary")?,
         path2: parse_path_args(&rest_args, "path2", "secondary")?,
         verbose,
+        psk,
     })
 }
 
@@ -124,11 +136,25 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             "{e}\nusage: bondnet-client path-diag --session-id N \
              --path1-id N --path1-local ADDR:PORT --path1-remote ADDR:PORT \
              --path2-id N --path2-local ADDR:PORT --path2-remote ADDR:PORT \
-             [--path1-name NAME] [--path2-name NAME] [--path2-disabled] [--verbose]"
+             [--path1-name NAME] [--path2-name NAME] [--path2-disabled] [--psk HEX] [--verbose]"
         )
     })?;
 
-    println!("WARNING: BondNet Day 13 is plaintext (no encryption yet). Development use only.");
+    if parsed.psk.is_some() {
+        println!("encryption: ENABLED (XChaCha20-Poly1305, session salt exchanged via PathHello)");
+    } else {
+        println!("WARNING: no --psk given, PathHello packets are plaintext. Development use only.");
+    }
+
+    // Day 20: one secure session shared by both paths (same session_id,
+    // same salt). Each path's UdpPath gets the session for encryption.
+    let secure = match &parsed.psk {
+        Some(key) => Some(Arc::new(
+            bondnet_crypto::SecureSession::new_with_random_salt(key, parsed.session_id)
+                .map_err(|e| format!("failed to derive session keys: {e}"))?,
+        )),
+        None => None,
+    };
 
     let mut manager = PathManager::new(vec![parsed.path1, parsed.path2])
         .map_err(|e| format!("invalid path configuration: {e}"))?;
@@ -158,6 +184,13 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
     // records these via its normal observation path (Day 6); check its
     // verbose log for the matching lines. PathHello is a control packet —
     // it carries a diagnostic sequence (not part of the ordered stream).
+    //
+    // Day 20: when encryption is on, the PathHello payload carries the
+    // 32-byte session salt so the server derives matching keys.
+    let hello_payload = secure
+        .as_ref()
+        .map(|s| s.session_salt().to_vec())
+        .unwrap_or_default();
     let mut diag_seq = 1u64;
     for status in manager.status() {
         if !status.initialized {
@@ -166,8 +199,12 @@ pub async fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
         let path = manager
             .get(status.path_id)
             .expect("initialized path is present");
+        // Day 20: attach the secure session to this path's transport.
+        if let Some(s) = &secure {
+            path.set_secure_session(Arc::clone(s));
+        }
         match path
-            .send_new(PacketType::PathHello, Vec::new(), diag_seq)
+            .send_new(PacketType::PathHello, hello_payload.clone(), diag_seq)
             .await
         {
             Ok(sequence) => {

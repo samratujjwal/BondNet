@@ -32,11 +32,16 @@ async fn main() {
         return;
     }
 
-    // Day 6 honesty: this speaks the BondNet protocol WITHOUT encryption.
-    // Crypto integration is a later milestone. Development use only.
-    println!(
-        "WARNING: BondNet Day 6 is plaintext (no encryption yet). Development use only — not a production VPN server."
-    );
+    // Day 20: the warning reflects the actual configuration. With --psk,
+    // DATA is authenticated-encrypted in both directions; without it,
+    // traffic is plaintext.
+    if config.psk.is_some() {
+        println!("encryption: ENABLED (XChaCha20-Poly1305, PSK from --psk)");
+    } else {
+        println!(
+            "WARNING: no --psk given, traffic is plaintext. Development use only — not a production VPN server."
+        );
+    }
 
     let server = Arc::new(Server::new(config));
     let shutdown = async {

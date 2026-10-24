@@ -357,10 +357,13 @@ pub struct Server {
     psk: Option<bondnet_crypto::CryptoKey>,
     /// Day 18: derived secure sessions, keyed by session_id. Created
     /// on-demand from the PSK when the first packet of a session arrives.
-    secure_sessions: Mutex<HashMap<u64, bondnet_crypto::SecureSession>>,
+    /// Held in an `Arc` so the TUN reader thread can look sessions up
+    /// per return packet (Day 20).
+    secure_sessions: Arc<Mutex<HashMap<u64, bondnet_crypto::SecureSession>>>,
     /// Day 19: session salts from PathHello, keyed by session_id.
     /// The client sends a 32-byte random salt in PathHello payload.
-    session_salts: Mutex<HashMap<u64, [u8; 32]>>,
+    /// Shared with the TUN reader thread (Day 20).
+    session_salts: Arc<Mutex<HashMap<u64, [u8; 32]>>>,
 }
 
 impl Server {
@@ -382,8 +385,8 @@ impl Server {
             reader_shutdown: Mutex::new(None),
             upload_order: Mutex::new(HashMap::new()),
             psk,
-            secure_sessions: Mutex::new(HashMap::new()),
-            session_salts: Mutex::new(HashMap::new()),
+            secure_sessions: Arc::new(Mutex::new(HashMap::new())),
+            session_salts: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -585,13 +588,9 @@ impl Server {
     // pieces, not a `&Server`).
     fn process_return_packet(&self, ip_packet: &[u8]) -> Option<ReturnDatagram> {
         let (session_id, path_id) = self.return_association()?;
-        // Day 19: get the secure session for return encryption (if PSK set).
-        let session = self
-            .secure_sessions
-            .lock()
-            .expect("sessions lock poisoned")
-            .get(&session_id)
-            .cloned();
+        // Day 20: get the secure session for return encryption (if PSK
+        // set). Derived on demand with the cached PathHello salt.
+        let session = self.get_secure_session(session_id);
         build_return_datagram(
             &self.registry,
             &self.stats,
@@ -616,10 +615,10 @@ impl Server {
         #[cfg(not(target_os = "linux"))]
         {
             let _ = (session_id, path_id, socket);
-            return Err(io::Error::new(
+            Err(io::Error::new(
                 io::ErrorKind::Unsupported,
                 "TUN return path is implemented on Linux only (Day 11)",
-            ));
+            ))
         }
         #[cfg(target_os = "linux")]
         {
@@ -653,6 +652,12 @@ impl Server {
         let verbose = self.config.verbose;
         let shutdown = Arc::new(AtomicBool::new(false));
         let reader_shutdown = Arc::clone(&shutdown);
+        // Day 20: share the session cache so the reader can encrypt
+        // return packets. Looked up per packet — the salt may arrive
+        // (via PathHello) after the reader starts.
+        let reader_sessions = Arc::clone(&self.secure_sessions);
+        let reader_salts = self.session_salts.clone();
+        let reader_psk = self.psk.clone();
         let handle = thread::Builder::new()
             .name("bondnet-tun-reader".to_string())
             .spawn(move || {
@@ -666,6 +671,9 @@ impl Server {
                     verbose,
                     reader_tx,
                     shutdown,
+                    reader_sessions,
+                    reader_salts,
+                    reader_psk,
                 )
             })
             .map_err(io::Error::other)?;
@@ -862,12 +870,35 @@ impl Server {
         // correlate the response. This does NOT go through the DATA
         // pipeline or the reorder buffer.
         if packet.header.packet_type == PacketType::PathKeepalive {
-            self.echo_keepalive(&packet, remote);
+            self.echo_keepalive(&packet, datagram, remote);
         }
     }
 
-    /// Day 17: send a PathKeepalive echo response to the probe sender.
-    ///
+    /// Day 20: get (or derive and cache) the secure session for a
+    /// session_id. Returns `None` when no PSK is configured (plaintext
+    /// mode) or key derivation fails. Uses the cached PathHello salt when
+    /// available, else zeros (backward compatible but less safe).
+    fn get_secure_session(&self, session_id: u64) -> Option<bondnet_crypto::SecureSession> {
+        let psk = self.psk.as_ref()?;
+        let salt = {
+            self.session_salts
+                .lock()
+                .expect("salts lock poisoned")
+                .get(&session_id)
+                .cloned()
+                .unwrap_or([0u8; 32])
+        };
+        let mut sessions = self.secure_sessions.lock().expect("sessions lock poisoned");
+        use std::collections::hash_map::Entry;
+        match sessions.entry(session_id) {
+            Entry::Occupied(e) => Some(e.get().clone()),
+            Entry::Vacant(e) => {
+                let s = bondnet_crypto::SecureSession::new(psk, session_id, salt).ok()?;
+                Some(e.insert(s).clone())
+            }
+        }
+    }
+
     /// Day 18: authenticate and decrypt a DATA packet.
     ///
     /// If no PSK is configured, returns the packet unchanged (plaintext
@@ -879,39 +910,12 @@ impl Server {
     /// The header (36 bytes) is used as AAD, authenticating packet_type,
     /// session_id, path_id, sequence, and payload_len.
     fn authenticate_data(&self, packet: Packet, datagram: &[u8]) -> Option<Packet> {
-        let psk = match &self.psk {
-            Some(k) => k,
+        let session = match &self.psk {
+            Some(_) => self.get_secure_session(packet.header.session_id)?,
             None => return Some(packet), // Plaintext mode.
         };
 
-        let session_id = packet.header.session_id;
         let sequence = packet.header.sequence;
-
-        // Get or derive the secure session for this session_id.
-        // Day 19: use the cached salt from PathHello (or zeros if not
-        // yet received — backward compatible but less safe).
-        let salt = {
-            self.session_salts
-                .lock()
-                .expect("salts lock poisoned")
-                .get(&session_id)
-                .cloned()
-                .unwrap_or([0u8; 32])
-        };
-        let session = {
-            let mut sessions = self.secure_sessions.lock().expect("sessions lock poisoned");
-            use std::collections::hash_map::Entry;
-            match sessions.entry(session_id) {
-                Entry::Occupied(e) => e.get().clone(),
-                Entry::Vacant(e) => {
-                    let s = match bondnet_crypto::SecureSession::new(psk, session_id, salt) {
-                        Ok(s) => s,
-                        Err(_) => return None,
-                    };
-                    e.insert(s).clone()
-                }
-            }
-        };
 
         // The AAD is the 36-byte header from the original datagram.
         if datagram.len() < bondnet_protocol::HEADER_LEN {
@@ -936,11 +940,20 @@ impl Server {
         }
     }
 
-    /// The response has the same session_id, path_id, and payload (probe
-    /// ID) as the request, with a fresh sequence number (0 = control).
-    /// Sent via `send_to` on the shared UDP socket; failures are counted
-    /// but not retried.
-    fn echo_keepalive(&self, request: &Packet, remote: SocketAddr) {
+    /// Day 17: send a PathKeepalive echo response to the probe sender.
+    ///
+    /// Day 20: when a PSK is configured, the probe is authenticated
+    /// (UploadControl domain, nonce counter in the payload) and the echo
+    /// is encrypted (ReturnControl domain). Probes that fail
+    /// authentication are dropped without a response and counted in
+    /// `auth_failures` — a forged probe must never keep a dead path
+    /// "healthy". Without a PSK, the plaintext echo is preserved.
+    ///
+    /// The response has the same session_id, path_id, and probe ID as the
+    /// request, with a fresh sequence number (0 = control). Sent via
+    /// `send_to` on the shared UDP socket; failures are counted but not
+    /// retried.
+    fn echo_keepalive(&self, request: &Packet, datagram: &[u8], remote: SocketAddr) {
         let socket = match self
             .udp_socket
             .lock()
@@ -950,6 +963,14 @@ impl Server {
             Some(s) => s,
             None => return,
         };
+
+        // Day 20: authenticate the probe and build the (possibly
+        // encrypted) echo payload. Returns None when authentication fails.
+        let echo_payload = match self.keepalive_echo_payload(request, datagram) {
+            Some(p) => p,
+            None => return,
+        };
+
         let response = Packet {
             header: PacketHeader {
                 version: PROTOCOL_VERSION,
@@ -960,7 +981,7 @@ impl Server {
                 packet_type: PacketType::PathKeepalive,
                 timestamp: request.header.timestamp,
             },
-            payload: request.payload.clone(),
+            payload: echo_payload,
         };
         let bytes = match response.encode() {
             Ok(b) => b,
@@ -976,6 +997,70 @@ impl Server {
                 }
             }
         });
+    }
+
+    /// Day 20: build the keepalive echo payload.
+    ///
+    /// Plaintext mode (no PSK): the request payload echoed unchanged.
+    /// Encrypted mode: the request wire payload must be
+    /// `counter(8) || ciphertext`; the counter selects the UploadControl
+    /// nonce, decryption must yield the 8-byte probe ID, and the echo is
+    /// `counter2(8) || encrypt(ReturnControl, probe_id)`. The response
+    /// header (payload_len = 32) is AAD for the echo encryption.
+    /// Returns `None` when authentication fails.
+    fn keepalive_echo_payload(&self, request: &Packet, datagram: &[u8]) -> Option<Vec<u8>> {
+        if self.psk.is_none() {
+            return Some(request.payload.clone());
+        }
+        let session = self.get_secure_session(request.header.session_id)?;
+        if request.payload.len() != 32 || datagram.len() < bondnet_protocol::HEADER_LEN {
+            self.stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
+        let counter = u64::from_be_bytes(request.payload[..8].try_into().ok()?);
+        let mut aad = [0u8; 36];
+        aad.copy_from_slice(&datagram[..36]);
+        let probe_id = match session.decrypt(
+            bondnet_crypto::KeyDomain::UploadControl,
+            counter,
+            &aad,
+            &request.payload[8..],
+        ) {
+            Ok(p) if p.len() == 8 => p,
+            _ => {
+                // Wrong key, wrong counter, or tampered bytes: the probe
+                // is not authentic. Drop it; never echo.
+                self.stats.auth_failures.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
+        // Build the response AAD from the response header as it will
+        // appear on the wire (payload_len = 32).
+        let resp_header = PacketHeader {
+            version: PROTOCOL_VERSION,
+            flags: 0,
+            session_id: request.header.session_id,
+            sequence: 0,
+            path_id: request.header.path_id,
+            packet_type: PacketType::PathKeepalive,
+            timestamp: request.header.timestamp,
+        };
+        let dummy = Packet {
+            header: resp_header,
+            payload: vec![0u8; 32],
+        };
+        let resp_aad: [u8; 36] = dummy.encode().ok()?.as_slice()[..36].try_into().ok()?;
+        let (resp_counter, ct) = session
+            .encrypt(
+                bondnet_crypto::KeyDomain::ReturnControl,
+                &resp_aad,
+                &probe_id,
+            )
+            .ok()?;
+        let mut wire = Vec::with_capacity(32);
+        wire.extend_from_slice(&resp_counter.to_be_bytes());
+        wire.extend_from_slice(&ct);
+        Some(wire)
     }
 
     /// Day 10 forward gate: `Data` → IP validation → bounded TUN queue.
@@ -1341,6 +1426,9 @@ fn tun_reader_loop(
     verbose: bool,
     return_tx: mpsc::Sender<ReturnDatagram>,
     shutdown: Arc<AtomicBool>,
+    secure_sessions: Arc<Mutex<HashMap<u64, bondnet_crypto::SecureSession>>>,
+    session_salts: Arc<Mutex<HashMap<u64, [u8; 32]>>>,
+    psk: Option<bondnet_crypto::CryptoKey>,
 ) {
     let fd = device.as_raw_fd();
     let mut pfd = libc::pollfd {
@@ -1385,6 +1473,28 @@ fn tun_reader_loop(
             Ok(n) => {
                 stats.tun_packets_read.fetch_add(1, Ordering::Relaxed);
                 stats.tun_bytes_read.fetch_add(n as u64, Ordering::Relaxed);
+                // Day 20: derive (or reuse) the secure session for this
+                // return packet, using the latest cached PathHello salt.
+                // The salt may arrive after the reader starts, so this is
+                // looked up per packet, not once at startup.
+                let session = psk.as_ref().and_then(|key| {
+                    let salt = session_salts
+                        .lock()
+                        .expect("salts lock poisoned")
+                        .get(&session_id)
+                        .cloned()
+                        .unwrap_or([0u8; 32]);
+                    let mut sessions = secure_sessions.lock().expect("sessions lock poisoned");
+                    use std::collections::hash_map::Entry;
+                    Some(match sessions.entry(session_id) {
+                        Entry::Occupied(e) => e.get().clone(),
+                        Entry::Vacant(e) => {
+                            let s =
+                                bondnet_crypto::SecureSession::new(key, session_id, salt).ok()?;
+                            e.insert(s).clone()
+                        }
+                    })
+                });
                 if let Some(datagram) = build_return_datagram(
                     &registry,
                     &stats,
@@ -1393,9 +1503,7 @@ fn tun_reader_loop(
                     max_age,
                     verbose,
                     &buf[..n],
-                    None, // Day 19: TUN reader thread does not yet support
-                          // encryption. Use process_return_packet for
-                          // encrypted returns (tested path).
+                    session.as_ref(),
                 ) && !enqueue_return_datagram(
                     &return_tx, datagram, &stats, verbose, session_id, path_id,
                 ) {
@@ -2214,5 +2322,330 @@ mod tests {
         p[1] = marker;
         p[2..4].copy_from_slice(&20u16.to_be_bytes());
         p
+    }
+
+    // Day 20: authenticated-transport tests.
+
+    fn test_psk() -> bondnet_crypto::CryptoKey {
+        bondnet_crypto::CryptoKey::from_slice(&[0x77; 32]).unwrap()
+    }
+
+    fn psk_server_with_queue(
+        capacity: usize,
+    ) -> (Server, mpsc::Receiver<Vec<u8>>, bondnet_crypto::CryptoKey) {
+        let key = test_psk();
+        let config = ServerConfig {
+            psk: Some(key.clone()),
+            ..Default::default()
+        };
+        let server = Server::new(config);
+        let (tx, rx) = mpsc::channel(capacity);
+        *server.tun_tx.lock().expect("tun queue lock poisoned") = Some(tx);
+        (server, rx, key)
+    }
+
+    fn psk_server_with_return(
+        session_id: u64,
+        path_id: u16,
+    ) -> (Server, bondnet_crypto::CryptoKey) {
+        let key = test_psk();
+        let config = ServerConfig {
+            psk: Some(key.clone()),
+            tun_name: Some("bondtun0".to_string()),
+            tun_addr: Some("10.200.0.1".parse().unwrap()),
+            tun_prefix: Some(24),
+            tun_return_session: Some(session_id),
+            tun_return_path: Some(path_id),
+            ..Default::default()
+        };
+        (Server::new(config), key)
+    }
+
+    /// Client-side helper: encrypt a DATA payload exactly like UdpPath
+    /// does (UploadData domain, sequence as nonce counter).
+    fn encrypted_data(
+        session: &bondnet_crypto::SecureSession,
+        session_id: u64,
+        path_id: u16,
+        sequence: u64,
+        plaintext: &[u8],
+    ) -> Vec<u8> {
+        let header = PacketHeader {
+            version: PROTOCOL_VERSION,
+            flags: 0,
+            session_id,
+            sequence,
+            path_id,
+            packet_type: PacketType::Data,
+            timestamp: 1_700_000_000_000,
+        };
+        let dummy = Packet {
+            header: header.clone(),
+            payload: vec![0u8; plaintext.len() + bondnet_crypto::TAG_SIZE],
+        };
+        let bytes = dummy.encode().expect("dummy must encode");
+        let mut aad = [0u8; 36];
+        aad.copy_from_slice(&bytes[..36]);
+        let ct = session
+            .encrypt_with_counter(
+                bondnet_crypto::KeyDomain::UploadData,
+                sequence,
+                &aad,
+                plaintext,
+            )
+            .expect("encryption must succeed");
+        Packet {
+            header,
+            payload: ct,
+        }
+        .encode()
+        .expect("datagram must encode")
+    }
+
+    /// Client-side helper: build an encrypted keepalive probe exactly
+    /// like the health monitor does (UploadControl domain).
+    fn encrypted_probe(
+        session: &bondnet_crypto::SecureSession,
+        session_id: u64,
+        path_id: u16,
+        probe_id: u64,
+    ) -> Vec<u8> {
+        let header = PacketHeader {
+            version: PROTOCOL_VERSION,
+            flags: 0,
+            session_id,
+            sequence: 0,
+            path_id,
+            packet_type: PacketType::PathKeepalive,
+            timestamp: 1_700_000_000_000,
+        };
+        let dummy = Packet {
+            header: header.clone(),
+            payload: vec![0u8; 32],
+        };
+        let bytes = dummy.encode().expect("dummy must encode");
+        let mut aad = [0u8; 36];
+        aad.copy_from_slice(&bytes[..36]);
+        let (counter, ct) = session
+            .encrypt(
+                bondnet_crypto::KeyDomain::UploadControl,
+                &aad,
+                &probe_id.to_be_bytes(),
+            )
+            .expect("encryption must succeed");
+        let mut wire = counter.to_be_bytes().to_vec();
+        wire.extend_from_slice(&ct);
+        Packet {
+            header,
+            payload: wire,
+        }
+        .encode()
+        .expect("datagram must encode")
+    }
+
+    #[test]
+    fn encrypted_upload_reaches_tun_decrypted() {
+        let (server, mut rx, key) = psk_server_with_queue(16);
+        let salt = [0x33; 32];
+        // PathHello delivers the session salt first.
+        let hello = encode_packet(1001, 1, 0, PacketType::PathHello, salt.to_vec());
+        server.handle_datagram(&hello, remote());
+        // Client encrypts DATA with the salted session.
+        let client = bondnet_crypto::SecureSession::new(&key, 1001, salt).unwrap();
+        let inner = ipv4_min();
+        let datagram = encrypted_data(&client, 1001, 1, 1, &inner);
+        server.handle_datagram(&datagram, remote());
+        let queued = rx.try_recv().expect("decrypted packet must reach TUN");
+        assert_eq!(queued, inner, "TUN must receive the exact plaintext");
+        assert_eq!(server.stats().auth_failures, 0);
+    }
+
+    #[test]
+    fn wrong_psk_upload_dropped_before_tun() {
+        let (server, mut rx, _key) = psk_server_with_queue(16);
+        let evil_key = bondnet_crypto::CryptoKey::from_slice(&[0x99; 32]).unwrap();
+        let evil = bondnet_crypto::SecureSession::new(&evil_key, 1001, [0x33; 32]).unwrap();
+        let datagram = encrypted_data(&evil, 1001, 1, 1, &ipv4_min());
+        server.handle_datagram(&datagram, remote());
+        assert!(rx.try_recv().is_err(), "forged packet must never reach TUN");
+        assert_eq!(server.stats().auth_failures, 1);
+        // The forged packet must not create a return endpoint either.
+        assert_eq!(server.stats().data_packets, 0);
+    }
+
+    #[test]
+    fn tampered_upload_dropped_before_tun() {
+        let (server, mut rx, key) = psk_server_with_queue(16);
+        let salt = [0x33; 32];
+        let hello = encode_packet(1001, 1, 0, PacketType::PathHello, salt.to_vec());
+        server.handle_datagram(&hello, remote());
+        let client = bondnet_crypto::SecureSession::new(&key, 1001, salt).unwrap();
+        let mut datagram = encrypted_data(&client, 1001, 1, 1, &ipv4_min());
+        // Flip a ciphertext byte (after header + before tag end).
+        let pos = 40;
+        datagram[pos] ^= 0xFF;
+        server.handle_datagram(&datagram, remote());
+        assert!(rx.try_recv().is_err(), "tampered packet must be dropped");
+        assert_eq!(server.stats().auth_failures, 1);
+    }
+
+    #[test]
+    fn encrypted_return_round_trip() {
+        let (server, key) = psk_server_with_return(1001, 1);
+        let salt = [0x44; 32];
+        let hello = encode_packet(1001, 1, 0, PacketType::PathHello, salt.to_vec());
+        server.handle_datagram(&hello, remote());
+        let client = bondnet_crypto::SecureSession::new(&key, 1001, salt).unwrap();
+        // Encrypted upload registers the return endpoint.
+        let up = encrypted_data(&client, 1001, 1, 1, &ipv4_min());
+        server.handle_datagram(&up, remote());
+        // Server builds the encrypted return datagram.
+        let inner_down = ipv4_with_seq(0xAB);
+        let (_dest, ret_bytes) = server
+            .process_return_packet(&inner_down)
+            .expect("endpoint association exists");
+        let ret_packet = Packet::decode(&ret_bytes).expect("return must decode");
+        assert_eq!(ret_packet.header.packet_type, PacketType::Data);
+        // Client decrypts with the ReturnData domain and return sequence.
+        let ret_seq = ret_packet.header.sequence;
+        let mut aad = [0u8; 36];
+        aad.copy_from_slice(&ret_bytes[..36]);
+        let plaintext = client
+            .decrypt(
+                bondnet_crypto::KeyDomain::ReturnData,
+                ret_seq,
+                &aad,
+                &ret_packet.payload,
+            )
+            .expect("return must authenticate");
+        assert_eq!(plaintext, inner_down);
+    }
+
+    #[test]
+    fn encrypted_keepalive_probe_echo_round_trip() {
+        let key = test_psk();
+        let config = ServerConfig {
+            psk: Some(key.clone()),
+            ..Default::default()
+        };
+        let server = Server::new(config);
+        let salt = [0x55; 32];
+        let hello = encode_packet(1001, 1, 0, PacketType::PathHello, salt.to_vec());
+        server.handle_datagram(&hello, remote());
+        let client = bondnet_crypto::SecureSession::new(&key, 1001, salt).unwrap();
+        let probe_id = 42u64;
+        let datagram = encrypted_probe(&client, 1001, 1, probe_id);
+        let packet = Packet::decode(&datagram).expect("probe must decode");
+        let echo = server
+            .keepalive_echo_payload(&packet, &datagram)
+            .expect("valid probe must get an echo");
+        assert_eq!(echo.len(), 32, "echo is counter(8) + ciphertext(24)");
+        // Client decrypts the echo with the ReturnControl domain. The
+        // response header mirrors the request (payload_len = 32).
+        let resp_header = PacketHeader {
+            version: PROTOCOL_VERSION,
+            flags: 0,
+            session_id: 1001,
+            sequence: 0,
+            path_id: 1,
+            packet_type: PacketType::PathKeepalive,
+            timestamp: 1_700_000_000_000,
+        };
+        let dummy = Packet {
+            header: resp_header,
+            payload: vec![0u8; 32],
+        };
+        let bytes = dummy.encode().unwrap();
+        let mut resp_aad = [0u8; 36];
+        resp_aad.copy_from_slice(&bytes[..36]);
+        let resp_counter = u64::from_be_bytes(echo[..8].try_into().unwrap());
+        let plaintext = client
+            .decrypt(
+                bondnet_crypto::KeyDomain::ReturnControl,
+                resp_counter,
+                &resp_aad,
+                &echo[8..],
+            )
+            .expect("echo must authenticate");
+        assert_eq!(
+            u64::from_be_bytes(plaintext[..8].try_into().unwrap()),
+            probe_id,
+            "echo must carry the same probe ID"
+        );
+    }
+
+    #[test]
+    fn forged_keepalive_gets_no_echo() {
+        let key = test_psk();
+        let config = ServerConfig {
+            psk: Some(key),
+            ..Default::default()
+        };
+        let server = Server::new(config);
+        // Attacker encrypts with a different PSK.
+        let evil_key = bondnet_crypto::CryptoKey::from_slice(&[0x99; 32]).unwrap();
+        let evil = bondnet_crypto::SecureSession::new(&evil_key, 1001, [0x55; 32]).unwrap();
+        let datagram = encrypted_probe(&evil, 1001, 1, 7);
+        let packet = Packet::decode(&datagram).expect("probe must decode");
+        assert!(
+            server.keepalive_echo_payload(&packet, &datagram).is_none(),
+            "forged probe must get no echo"
+        );
+        assert_eq!(server.stats().auth_failures, 1);
+    }
+
+    #[test]
+    fn tampered_keepalive_probe_gets_no_echo() {
+        let key = test_psk();
+        let config = ServerConfig {
+            psk: Some(key.clone()),
+            ..Default::default()
+        };
+        let server = Server::new(config);
+        let salt = [0x55; 32];
+        let hello = encode_packet(1001, 1, 0, PacketType::PathHello, salt.to_vec());
+        server.handle_datagram(&hello, remote());
+        let client = bondnet_crypto::SecureSession::new(&key, 1001, salt).unwrap();
+        let mut datagram = encrypted_probe(&client, 1001, 1, 7);
+        // Flip a byte inside the ciphertext region.
+        let pos = 36 + 8 + 5;
+        datagram[pos] ^= 0xFF;
+        let packet = Packet::decode(&datagram).expect("probe must decode");
+        assert!(
+            server.keepalive_echo_payload(&packet, &datagram).is_none(),
+            "tampered probe must get no echo"
+        );
+        assert_eq!(server.stats().auth_failures, 1);
+    }
+
+    #[test]
+    fn plaintext_keepalive_echo_unchanged_without_psk() {
+        let (server, _rx) = server_with_queue(16);
+        let probe = 7u64.to_be_bytes().to_vec();
+        let datagram = encode_packet(1001, 1, 0, PacketType::PathKeepalive, probe.clone());
+        let packet = Packet::decode(&datagram).expect("probe must decode");
+        let echo = server
+            .keepalive_echo_payload(&packet, &datagram)
+            .expect("plaintext mode echoes");
+        assert_eq!(echo, probe, "plaintext echo is byte-identical");
+    }
+
+    #[test]
+    fn replayed_upload_sequence_delivered_once() {
+        // Day 15's OrderedReceiver drops duplicates: the same encrypted
+        // datagram twice must queue only one TUN packet.
+        let (server, mut rx, key) = psk_server_with_queue(16);
+        let salt = [0x33; 32];
+        let hello = encode_packet(1001, 1, 0, PacketType::PathHello, salt.to_vec());
+        server.handle_datagram(&hello, remote());
+        let client = bondnet_crypto::SecureSession::new(&key, 1001, salt).unwrap();
+        let datagram = encrypted_data(&client, 1001, 1, 1, &ipv4_min());
+        server.handle_datagram(&datagram, remote());
+        server.handle_datagram(&datagram, remote()); // replay
+        assert!(rx.try_recv().is_ok(), "first delivery reaches TUN");
+        assert!(
+            rx.try_recv().is_err(),
+            "replayed duplicate must not reach TUN twice"
+        );
     }
 }

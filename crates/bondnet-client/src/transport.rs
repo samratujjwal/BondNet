@@ -105,6 +105,17 @@ impl UdpPath {
         *self.secure_session.lock().expect("secure lock poisoned") = Some(session);
     }
 
+    /// Day 20: the session salt of the attached secure session, if any.
+    /// The caller sends this in the PathHello payload (32 bytes) so the
+    /// server derives matching keys.
+    pub fn secure_salt(&self) -> Option<[u8; 32]> {
+        self.secure_session
+            .lock()
+            .expect("secure lock poisoned")
+            .as_ref()
+            .map(|s| *s.session_salt())
+    }
+
     /// The actual bound local address (ephemeral port resolved).
     pub fn local_addr(&self) -> io::Result<SocketAddr> {
         self.socket.local_addr()

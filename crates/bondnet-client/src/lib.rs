@@ -29,7 +29,8 @@ pub mod transport;
 pub mod wintun;
 
 pub use config::{
-    DEFAULT_BANDWIDTH_BPS, PhysicalPathConfig, UdpPathConfig, parse_args, validate_path_configs,
+    DEFAULT_BANDWIDTH_BPS, PhysicalPathConfig, UdpPathConfig, parse_args, parse_psk_hex,
+    validate_path_configs,
 };
 pub use data_plane::{
     DATA_PLANE_CHANNEL_CAPACITY, DataPlane, DataPlaneError, DataPlaneMetrics,

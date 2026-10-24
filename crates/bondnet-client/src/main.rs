@@ -45,8 +45,40 @@ mod tunnel_smoke;
 use bondnet_client::bench;
 use bondnet_client::health_diag;
 
-use bondnet_client::{UdpPath, parse_args};
+use bondnet_client::{UdpPath, parse_args, parse_psk_hex};
 use bondnet_protocol::PacketType;
+
+/// Day 20: like [`parse_args`](bondnet_client::parse_args) but also
+/// accepts `--psk HEX`. The PSK is stripped before delegating so the
+/// base parser's behavior is unchanged.
+fn parse_args_psk(
+    args: &[String],
+) -> Result<
+    (
+        bondnet_client::UdpPathConfig,
+        u64,
+        bool,
+        Option<bondnet_crypto::CryptoKey>,
+    ),
+    String,
+> {
+    let mut filtered: Vec<String> = Vec::with_capacity(args.len());
+    filtered.push(args[0].clone());
+    let mut psk: Option<bondnet_crypto::CryptoKey> = None;
+    let mut rest = args.iter().skip(1).peekable();
+    while let Some(arg) = rest.next() {
+        if arg == "--psk" {
+            let v = rest
+                .next()
+                .ok_or_else(|| "--psk requires a 64-char hex string".to_string())?;
+            psk = Some(parse_psk_hex(v)?);
+        } else {
+            filtered.push(arg.clone());
+        }
+    }
+    let (config, count, verbose) = parse_args(&filtered)?;
+    Ok((config, count, verbose, psk))
+}
 
 #[tokio::main]
 async fn main() {
@@ -83,13 +115,31 @@ async fn run_wintun_smoke(_args: &[String]) -> Result<(), Box<dyn std::error::Er
 }
 
 async fn run_path_client(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
-    let (config, count, verbose) = parse_args(args).map_err(|e| format!("{e}\nusage: bondnet-client --local ADDR:PORT --remote ADDR:PORT --path-id N --session-id N [--count N] [--verbose]"))?;
-
-    println!(
-        "WARNING: BondNet Day 7 is plaintext (no encryption yet). Development use only — send harmless test payloads, never secrets."
-    );
+    let (config, count, verbose, psk) =
+        parse_args_psk(args).map_err(|e| format!("{e}\nusage: bondnet-client --local ADDR:PORT --remote ADDR:PORT --path-id N --session-id N [--count N] [--psk HEX] [--verbose]"))?;
 
     let path = UdpPath::bind(config).await?;
+
+    // Day 20: attach encryption when --psk is given. The session gets a
+    // fresh random salt; the salt travels in the PathHello payload so the
+    // server derives matching keys.
+    match psk {
+        Some(key) => {
+            let s = std::sync::Arc::new(
+                bondnet_crypto::SecureSession::new_with_random_salt(&key, path.session_id())
+                    .map_err(|e| format!("failed to derive session keys: {e}"))?,
+            );
+            path.set_secure_session(s);
+            println!(
+                "encryption: ENABLED (XChaCha20-Poly1305, session salt exchanged via PathHello)"
+            );
+        }
+        None => {
+            println!(
+                "WARNING: no --psk given, traffic is plaintext. Development use only — send harmless test payloads, never secrets."
+            );
+        }
+    };
     let actual_local = path.local_addr()?;
 
     // §25: prove the socket really owns the configured physical address.
@@ -117,6 +167,9 @@ async fn run_path_client(args: &[String]) -> Result<(), Box<dyn std::error::Erro
         };
         let payload = match packet_type {
             PacketType::Data => format!("bondnet-day7-ping-{i}").into_bytes(),
+            // Day 20: PathHello carries the 32-byte session salt when
+            // encryption is on, so the server derives matching keys.
+            PacketType::PathHello => path.secure_salt().map(|s| s.to_vec()).unwrap_or_default(),
             _ => Vec::new(),
         };
         // Day 15: explicit session-wide sequence (i+1). This is the legacy

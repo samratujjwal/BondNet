@@ -25,6 +25,10 @@ use bondnet_protocol::{PROTOCOL_VERSION, Packet, PacketHeader, PacketType};
 use crate::health::{HealthConfig, HealthState, PathHealthTracker};
 use crate::path_manager::PathManager;
 
+/// Wire size of an encrypted keepalive payload: 8-byte nonce counter +
+/// (8-byte probe ID + 16-byte Poly1305 tag).
+const ENCRYPTED_KEEPALIVE_PAYLOAD_LEN: usize = 32;
+
 /// Commands for the health monitor task.
 #[derive(Debug)]
 enum MonitorCommand {
@@ -39,6 +43,10 @@ pub struct HealthMonitor {
     trackers: Arc<Mutex<HashMap<u16, PathHealthTracker>>>,
     cmd_tx: Option<mpsc::Sender<MonitorCommand>>,
     task: Option<JoinHandle<()>>,
+    /// Day 20: optional secure session for keepalive authentication.
+    /// When set, probes are encrypted (UploadControl) and responses are
+    /// authenticated (ReturnControl).
+    secure_session: Arc<Mutex<Option<Arc<bondnet_crypto::SecureSession>>>>,
 }
 
 impl HealthMonitor {
@@ -56,7 +64,16 @@ impl HealthMonitor {
             trackers: Arc::new(Mutex::new(HashMap::new())),
             cmd_tx: None,
             task: None,
+            secure_session: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Day 20: attach a secure session for keepalive authentication.
+    /// Probes are encrypted with the UploadControl domain; responses are
+    /// verified with the ReturnControl domain. Without a session,
+    /// keepalives stay plaintext (backward compatible).
+    pub fn set_secure_session(&self, session: Arc<bondnet_crypto::SecureSession>) {
+        *self.secure_session.lock().expect("secure lock poisoned") = Some(session);
     }
 
     /// Start the background monitoring task.
@@ -84,9 +101,10 @@ impl HealthMonitor {
         let session_id = self.session_id;
         let config = self.config.clone();
         let trackers = Arc::clone(&self.trackers);
+        let secure = Arc::clone(&self.secure_session);
 
         let task = tokio::spawn(async move {
-            monitor_loop(manager, session_id, config, trackers, cmd_rx).await;
+            monitor_loop(manager, session_id, config, trackers, secure, cmd_rx).await;
         });
 
         self.cmd_tx = Some(cmd_tx);
@@ -117,6 +135,7 @@ async fn monitor_loop(
     session_id: u64,
     config: HealthConfig,
     trackers: Arc<Mutex<HashMap<u16, PathHealthTracker>>>,
+    secure_session: Arc<Mutex<Option<Arc<bondnet_crypto::SecureSession>>>>,
     mut cmd_rx: mpsc::Receiver<MonitorCommand>,
 ) {
     // Bind a single UDP socket for all health probes.
@@ -132,9 +151,17 @@ async fn monitor_loop(
     let recv_socket = Arc::clone(&socket);
     let recv_trackers = Arc::clone(&trackers);
     let recv_manager = Arc::clone(&manager);
+    let recv_secure = Arc::clone(&secure_session);
     let recv_session = session_id;
     let receiver = tokio::spawn(async move {
-        receiver_loop(recv_socket, recv_session, recv_trackers, recv_manager).await;
+        receiver_loop(
+            recv_socket,
+            recv_session,
+            recv_trackers,
+            recv_manager,
+            recv_secure,
+        )
+        .await;
     });
 
     let mut interval = tokio::time::interval(config.heartbeat_interval);
@@ -145,7 +172,7 @@ async fn monitor_loop(
         tokio::select! {
             _ = interval.tick() => {
                 // Send probes on all enabled paths.
-                send_probes(&manager, &socket, session_id, &trackers).await;
+                send_probes(&manager, &socket, session_id, &trackers, &secure_session).await;
             }
             cmd = cmd_rx.recv() => {
                 match cmd {
@@ -163,11 +190,17 @@ async fn monitor_loop(
 }
 
 /// Receives PathKeepalive responses and updates trackers.
+///
+/// Day 20: when a secure session is attached, responses are
+/// authenticated (ReturnControl domain, nonce counter in the payload).
+/// Unauthenticated or undecryptable responses are ignored and never
+/// affect path health.
 async fn receiver_loop(
     socket: Arc<UdpSocket>,
     session_id: u64,
     trackers: Arc<Mutex<HashMap<u16, PathHealthTracker>>>,
     manager: Arc<Mutex<PathManager>>,
+    secure_session: Arc<Mutex<Option<Arc<bondnet_crypto::SecureSession>>>>,
 ) {
     let mut buf = [0u8; 2048];
     loop {
@@ -188,21 +221,11 @@ async fn receiver_loop(
         if packet.header.session_id != session_id {
             continue;
         }
-        // Payload must be exactly 8 bytes (the probe ID).
-        if packet.payload.len() != 8 {
-            continue;
-        }
 
-        let probe_id = u64::from_be_bytes([
-            packet.payload[0],
-            packet.payload[1],
-            packet.payload[2],
-            packet.payload[3],
-            packet.payload[4],
-            packet.payload[5],
-            packet.payload[6],
-            packet.payload[7],
-        ]);
+        let probe_id = match authenticated_probe_id(&packet, &buf[..len], &secure_session) {
+            Some(id) => id,
+            None => continue, // Wrong shape or failed authentication: ignore.
+        };
         let path_id = packet.header.path_id;
 
         // Update the tracker for this path.
@@ -221,12 +244,61 @@ async fn receiver_loop(
     }
 }
 
+/// Extract the probe ID from a keepalive response, authenticating it
+/// when a secure session is attached.
+///
+/// Plaintext mode: payload must be exactly 8 bytes (the probe ID).
+/// Encrypted mode: payload is `counter(8) || ciphertext`; the counter
+/// selects the ReturnControl nonce, and decryption must yield exactly
+/// 8 bytes. Returns `None` on any mismatch or authentication failure.
+fn authenticated_probe_id(
+    packet: &Packet,
+    datagram: &[u8],
+    secure_session: &Arc<Mutex<Option<Arc<bondnet_crypto::SecureSession>>>>,
+) -> Option<u64> {
+    let session_opt = secure_session.lock().expect("secure lock poisoned").clone();
+    match session_opt {
+        None => {
+            if packet.payload.len() != 8 {
+                return None;
+            }
+            Some(u64::from_be_bytes(packet.payload[..8].try_into().ok()?))
+        }
+        Some(session) => {
+            if packet.payload.len() != ENCRYPTED_KEEPALIVE_PAYLOAD_LEN || datagram.len() < 36 {
+                return None;
+            }
+            let counter = u64::from_be_bytes(packet.payload[..8].try_into().ok()?);
+            let mut aad = [0u8; 36];
+            aad.copy_from_slice(&datagram[..36]);
+            let plaintext = session
+                .decrypt(
+                    bondnet_crypto::KeyDomain::ReturnControl,
+                    counter,
+                    &aad,
+                    &packet.payload[8..],
+                )
+                .ok()?;
+            if plaintext.len() != 8 {
+                return None;
+            }
+            Some(u64::from_be_bytes(plaintext[..8].try_into().ok()?))
+        }
+    }
+}
+
 /// Send a PathKeepalive probe on each enabled path.
+///
+/// Day 20: when a secure session is attached, the probe payload is
+/// encrypted with the UploadControl domain. The wire payload is
+/// `counter(8) || ciphertext`; the counter selects the nonce on the
+/// server side. The 36-byte header is AAD (payload_len = 32).
 async fn send_probes(
     manager: &Arc<Mutex<PathManager>>,
     socket: &Arc<UdpSocket>,
     session_id: u64,
     trackers: &Arc<Mutex<HashMap<u16, PathHealthTracker>>>,
+    secure_session: &Arc<Mutex<Option<Arc<bondnet_crypto::SecureSession>>>>,
 ) {
     // Get the list of enabled paths and their remote addresses.
     let paths: Vec<(u16, SocketAddr)> = {
@@ -247,23 +319,25 @@ async fn send_probes(
             }
         };
 
-        // Build the PathKeepalive probe.
-        let payload = probe_id.to_be_bytes().to_vec();
-        let packet = Packet {
-            header: PacketHeader {
-                version: PROTOCOL_VERSION,
-                flags: 0,
-                session_id,
-                sequence: 0, // Control packets don't use ordered sequence.
-                path_id,
-                packet_type: PacketType::PathKeepalive,
-                timestamp: std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0),
-            },
-            payload,
+        let header = PacketHeader {
+            version: PROTOCOL_VERSION,
+            flags: 0,
+            session_id,
+            sequence: 0, // Control packets don't use ordered sequence.
+            path_id,
+            packet_type: PacketType::PathKeepalive,
+            timestamp: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0),
         };
+        let payload = match keepalive_probe_payload(&header, probe_id, secure_session) {
+            Some(p) => p,
+            None => continue, // Encryption failed: skip this probe, keep the schedule.
+        };
+
+        // Build the PathKeepalive probe.
+        let packet = Packet { header, payload };
 
         let bytes = match packet.encode() {
             Ok(b) => b,
@@ -286,6 +360,46 @@ async fn send_probes(
 
         // Update the manager's scheduler health based on tracker state.
         update_manager_health(manager, trackers, path_id);
+    }
+}
+
+/// Build a keepalive probe payload.
+///
+/// Plaintext mode: the 8-byte probe ID. Encrypted mode: `counter(8) ||
+/// ciphertext` where the ciphertext is the probe ID encrypted with the
+/// UploadControl domain. The header is AAD; its payload_len field must
+/// equal the wire payload length, so the AAD is derived from a dummy
+/// packet with the known final size (32 bytes encrypted, 8 plaintext).
+/// Returns `None` when encryption fails — the caller skips the probe.
+fn keepalive_probe_payload(
+    header: &PacketHeader,
+    probe_id: u64,
+    secure_session: &Arc<Mutex<Option<Arc<bondnet_crypto::SecureSession>>>>,
+) -> Option<Vec<u8>> {
+    let session_opt = secure_session.lock().expect("secure lock poisoned").clone();
+    match session_opt {
+        None => Some(probe_id.to_be_bytes().to_vec()),
+        Some(session) => {
+            // The AAD is the 36-byte header as it will appear on the wire
+            // (payload_len = 32). Encode a dummy packet to capture it.
+            let dummy = Packet {
+                header: header.clone(),
+                payload: vec![0u8; ENCRYPTED_KEEPALIVE_PAYLOAD_LEN],
+            };
+            let aad: [u8; 36] = dummy.encode().ok()?.as_slice()[..36].try_into().ok()?;
+            let (counter, ct) = session
+                .encrypt(
+                    bondnet_crypto::KeyDomain::UploadControl,
+                    &aad,
+                    &probe_id.to_be_bytes(),
+                )
+                .ok()?;
+            let mut wire = Vec::with_capacity(ENCRYPTED_KEEPALIVE_PAYLOAD_LEN);
+            wire.extend_from_slice(&counter.to_be_bytes());
+            wire.extend_from_slice(&ct);
+            debug_assert_eq!(wire.len(), ENCRYPTED_KEEPALIVE_PAYLOAD_LEN);
+            Some(wire)
+        }
     }
 }
 
@@ -371,5 +485,202 @@ mod tests {
         monitor.start().unwrap();
         assert!(monitor.start().is_err());
         monitor.shutdown().await;
+    }
+
+    // Day 20: keepalive authentication tests.
+
+    fn test_session() -> Arc<bondnet_crypto::SecureSession> {
+        let psk = bondnet_crypto::CryptoKey::from_slice(&[0x77; 32]).unwrap();
+        Arc::new(bondnet_crypto::SecureSession::new(&psk, 1001, [0x55; 32]).unwrap())
+    }
+
+    fn secure_holder(
+        session: Arc<bondnet_crypto::SecureSession>,
+    ) -> Arc<Mutex<Option<Arc<bondnet_crypto::SecureSession>>>> {
+        Arc::new(Mutex::new(Some(session)))
+    }
+
+    fn probe_header() -> PacketHeader {
+        PacketHeader {
+            version: PROTOCOL_VERSION,
+            flags: 0,
+            session_id: 1001,
+            sequence: 0,
+            path_id: 1,
+            packet_type: PacketType::PathKeepalive,
+            timestamp: 1_700_000_000,
+        }
+    }
+
+    /// Simulate the server side: decrypt the probe (UploadControl) and
+    /// build the encrypted echo (ReturnControl), like
+    /// `Server::keepalive_echo_payload` does.
+    fn server_echo(
+        session: &bondnet_crypto::SecureSession,
+        probe_datagram: &[u8],
+    ) -> Option<Vec<u8>> {
+        let packet = Packet::decode(probe_datagram).ok()?;
+        if packet.payload.len() != ENCRYPTED_KEEPALIVE_PAYLOAD_LEN {
+            return None;
+        }
+        let counter = u64::from_be_bytes(packet.payload[..8].try_into().ok()?);
+        let mut aad = [0u8; 36];
+        aad.copy_from_slice(&probe_datagram[..36]);
+        let probe_id = session
+            .decrypt(
+                bondnet_crypto::KeyDomain::UploadControl,
+                counter,
+                &aad,
+                &packet.payload[8..],
+            )
+            .ok()?;
+        // Response header mirrors the request.
+        let resp_header = PacketHeader {
+            timestamp: packet.header.timestamp,
+            ..probe_header()
+        };
+        let dummy = Packet {
+            header: resp_header.clone(),
+            payload: vec![0u8; ENCRYPTED_KEEPALIVE_PAYLOAD_LEN],
+        };
+        let bytes = dummy.encode().ok()?;
+        let mut resp_aad = [0u8; 36];
+        resp_aad.copy_from_slice(&bytes[..36]);
+        let (resp_counter, ct) = session
+            .encrypt(
+                bondnet_crypto::KeyDomain::ReturnControl,
+                &resp_aad,
+                &probe_id,
+            )
+            .ok()?;
+        let mut wire = resp_counter.to_be_bytes().to_vec();
+        wire.extend_from_slice(&ct);
+        Packet {
+            header: resp_header,
+            payload: wire,
+        }
+        .encode()
+        .ok()
+    }
+
+    #[test]
+    fn encrypted_probe_response_round_trip() {
+        let session = test_session();
+        let holder = secure_holder(Arc::clone(&session));
+        let header = probe_header();
+        let probe_id = 12345u64;
+        let payload =
+            keepalive_probe_payload(&header, probe_id, &holder).expect("probe must encrypt");
+        assert_eq!(payload.len(), ENCRYPTED_KEEPALIVE_PAYLOAD_LEN);
+        let datagram = Packet { header, payload }.encode().unwrap();
+        // Server echoes.
+        let echo_datagram = server_echo(&session, &datagram).expect("server must echo");
+        let echo_packet = Packet::decode(&echo_datagram).unwrap();
+        // Client authenticates the response.
+        let got = authenticated_probe_id(&echo_packet, &echo_datagram, &holder)
+            .expect("response must authenticate");
+        assert_eq!(got, probe_id);
+    }
+
+    #[test]
+    fn tampered_probe_response_rejected() {
+        let session = test_session();
+        let holder = secure_holder(Arc::clone(&session));
+        let header = probe_header();
+        let payload = keepalive_probe_payload(&header, 99, &holder).unwrap();
+        let datagram = Packet { header, payload }.encode().unwrap();
+        let mut echo_datagram = server_echo(&session, &datagram).unwrap();
+        // Flip a byte in the response ciphertext.
+        let pos = 36 + 8 + 3;
+        echo_datagram[pos] ^= 0xFF;
+        let echo_packet = Packet::decode(&echo_datagram).unwrap();
+        assert!(
+            authenticated_probe_id(&echo_packet, &echo_datagram, &holder).is_none(),
+            "tampered response must be rejected"
+        );
+    }
+
+    #[test]
+    fn wrong_key_probe_response_rejected() {
+        let session = test_session();
+        let holder = secure_holder(Arc::clone(&session));
+        // Attacker encrypts the *response* with a different key.
+        let evil_psk = bondnet_crypto::CryptoKey::from_slice(&[0x99; 32]).unwrap();
+        let evil = bondnet_crypto::SecureSession::new(&evil_psk, 1001, [0x55; 32]).unwrap();
+        let resp_header = probe_header();
+        let dummy = Packet {
+            header: resp_header.clone(),
+            payload: vec![0u8; ENCRYPTED_KEEPALIVE_PAYLOAD_LEN],
+        };
+        let bytes = dummy.encode().unwrap();
+        let mut aad = [0u8; 36];
+        aad.copy_from_slice(&bytes[..36]);
+        let (counter, ct) = evil
+            .encrypt(
+                bondnet_crypto::KeyDomain::ReturnControl,
+                &aad,
+                &7u64.to_be_bytes(),
+            )
+            .unwrap();
+        let mut wire = counter.to_be_bytes().to_vec();
+        wire.extend_from_slice(&ct);
+        let datagram = Packet {
+            header: resp_header,
+            payload: wire,
+        }
+        .encode()
+        .unwrap();
+        let packet = Packet::decode(&datagram).unwrap();
+        assert!(
+            authenticated_probe_id(&packet, &datagram, &holder).is_none(),
+            "wrong-key response must be rejected"
+        );
+    }
+
+    #[test]
+    fn plaintext_probe_response_still_works() {
+        // No session attached: legacy 8-byte plaintext behavior.
+        let holder: Arc<Mutex<Option<Arc<bondnet_crypto::SecureSession>>>> =
+            Arc::new(Mutex::new(None));
+        let header = probe_header();
+        let payload = keepalive_probe_payload(&header, 777, &holder).unwrap();
+        assert_eq!(payload.len(), 8);
+        let datagram = Packet { header, payload }.encode().unwrap();
+        let packet = Packet::decode(&datagram).unwrap();
+        let got = authenticated_probe_id(&packet, &datagram, &holder).expect("plaintext works");
+        assert_eq!(got, 777);
+    }
+
+    #[test]
+    fn short_payload_rejected_in_encrypted_mode() {
+        let session = test_session();
+        let holder = secure_holder(session);
+        // Encrypted mode but truncated payload: must be rejected, not panic.
+        let header = probe_header();
+        let datagram = Packet {
+            header,
+            payload: vec![0u8; 10],
+        }
+        .encode()
+        .unwrap();
+        let packet = Packet::decode(&datagram).unwrap();
+        assert!(
+            authenticated_probe_id(&packet, &datagram, &holder).is_none(),
+            "short payload must be rejected"
+        );
+    }
+
+    #[test]
+    fn monitor_accepts_secure_session() {
+        let manager = test_manager();
+        let monitor =
+            HealthMonitor::new(Arc::clone(&manager), 1001, HealthConfig::default()).unwrap();
+        monitor.set_secure_session(test_session());
+        let attached = monitor
+            .secure_session
+            .lock()
+            .expect("secure lock poisoned")
+            .is_some();
+        assert!(attached, "session must be attached");
     }
 }

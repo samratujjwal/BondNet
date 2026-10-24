@@ -118,6 +118,31 @@ pub fn validate_path_configs(paths: &[PhysicalPathConfig]) -> Result<(), String>
     Ok(())
 }
 
+/// Parse a 64-char hex pre-shared key (32 bytes) into a [`CryptoKey`].
+///
+/// Mirrors the server's `--psk` parsing. Fails closed on wrong length or
+/// non-hex input — never silently truncates or pads.
+pub fn parse_psk_hex(hex: &str) -> Result<bondnet_crypto::CryptoKey, String> {
+    if hex.len() != 64 {
+        return Err(format!(
+            "invalid --psk: expected 64 hex chars (32 bytes), got {}",
+            hex.len()
+        ));
+    }
+    let mut bytes = [0u8; 32];
+    for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
+        let hi = (chunk[0] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid --psk: not hex at position {}", i * 2))?;
+        let lo = (chunk[1] as char)
+            .to_digit(16)
+            .ok_or_else(|| format!("invalid --psk: not hex at position {}", i * 2 + 1))?;
+        bytes[i] = ((hi << 4) | lo) as u8;
+    }
+    bondnet_crypto::CryptoKey::from_slice(&bytes)
+        .map_err(|_| "invalid --psk: must be 32 bytes".to_string())
+}
+
 /// Parse a minimal dev CLI:
 ///
 /// `bondnet-client --local 192.168.0.170:0 --remote VPS:51820
@@ -338,5 +363,34 @@ mod tests {
         assert_eq!(udp.path_id, 1);
         assert_eq!(udp.session_id, 1001);
         assert_eq!(udp.local_addr.to_string(), "127.0.0.1:0");
+    }
+
+    // Day 20: --psk parsing.
+
+    #[test]
+    fn parse_psk_hex_accepts_64_hex_chars() {
+        let key = parse_psk_hex(&"ab".repeat(32)).unwrap();
+        assert_eq!(key.as_bytes(), &[0xab; 32]);
+    }
+
+    #[test]
+    fn parse_psk_hex_rejects_wrong_length() {
+        assert!(parse_psk_hex("ab").is_err());
+        assert!(parse_psk_hex(&"ab".repeat(33)).is_err());
+        assert!(parse_psk_hex("").is_err());
+    }
+
+    #[test]
+    fn parse_psk_hex_rejects_non_hex() {
+        let mut bad = "ab".repeat(32);
+        bad.replace_range(0..2, "zz");
+        assert!(parse_psk_hex(&bad).is_err());
+    }
+
+    #[test]
+    fn parse_psk_hex_is_case_insensitive() {
+        let lower = parse_psk_hex(&"ab".repeat(32)).unwrap();
+        let upper = parse_psk_hex(&"AB".repeat(32)).unwrap();
+        assert_eq!(lower.as_bytes(), upper.as_bytes());
     }
 }
